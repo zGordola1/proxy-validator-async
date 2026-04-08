@@ -76,6 +76,7 @@ python proxyzin.py -w 20 -c 30 -t 8 -o proxies_validados.txt -r 10 -m append
 | `-P` | `--geo-provider` |
 | `-y` | `--geo-timeout` |
 | `-K` | `--geo-max-concurrent` |
+| | `--geo-requests-per-second` |
 | `-d` | `--detail-output` |
 | | `--sources-file` |
 | | `--sqlite-db` |
@@ -123,9 +124,16 @@ python proxyzin.py -S -w 20 -r 8
 
 ## Geolocalização e CSV
 
+O provedor default **`ip-api`** (gratuito, sem chave) limita o uso a cerca de **45 pedidos por minuto** por endereço IP de origem. O ProxyZin **deduplica** por `origin_ip` (vários proxies com o mesmo IP de saída geram uma só consulta). Mesmo assim, com muitos IPs únicos, convém:
+
+- baixar a concorrência: `-K 1` ou `-K 2`;
+- e/ou limitar a taxa global de geo: `--geo-requests-per-second 0.75` (≈45/min).
+
 ```bash
-python proxyzin.py -g -d proxies_validados_detalhado.csv -y 3 -K 8
+python proxyzin.py -g -d proxies_validados_detalhado.csv -y 3 -K 4 --geo-requests-per-second 0.75
 ```
+
+Se a API responder mal ou bloquear, as localizações aparecem como `unknown` no CSV/SQLite (o proxy continua válido).
 
 ## Fluxo de validação
 
@@ -162,7 +170,9 @@ O repositório inclui [`.github/workflows/ci.yml`](.github/workflows/ci.yml): em
 
 5. **Saída ordenada** — Antes de gravar CSV (`-d`), SQLite (`--sqlite-db`) e o ficheiro `-o` em modo `final`, as entradas válidas são ordenadas por `proxy` (exportação reproduzível). Em `-m append`, o ficheiro `-o` continua a ser escrito à medida que os proxies passam (ordem de conclusão).
 
-6. **Geo** — IPs de saída repetidos partilham uma única consulta ao provedor (menos chamadas HTTP).
+6. **Geo** — IPs de saída repetidos partilham uma única consulta ao provedor (menos chamadas HTTP). O **ip-api** gratuito tem teto ~**45 req/min**; usa `-K` baixo e opcionalmente `--geo-requests-per-second` (ex. `0.75`) para evitar bloqueios temporários e respostas `unknown`.
+
+7. **`requirements.txt`** — As dependências (`aiohttp`, `aiohttp-socks`, `rich`) estão declaradas explicitamente; não é necessário `pip freeze` para SOCKS: basta `pip install -r requirements.txt`. Com `-S` sem `aiohttp-socks`, o programa avisa com erro claro.
 
 ## Diagnóstico
 

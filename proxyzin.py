@@ -369,6 +369,7 @@ async def apply_geo_to_details(
     provider: str,
     timeout_seconds: float,
     max_concurrent: int,
+    rate_limiter: AsyncRateLimiter | None = None,
 ) -> None:
     if not details:
         return
@@ -378,6 +379,8 @@ async def apply_geo_to_details(
     sem = asyncio.Semaphore(max(1, max_concurrent))
 
     async def resolve_ip(ip: str) -> tuple[str, str]:
+        if rate_limiter is not None:
+            await rate_limiter.wait_turn()
         async with sem:
             loc = await fetch_geo_location(session, ip, provider, timeout_seconds)
         return ip, loc
@@ -712,6 +715,7 @@ async def run_validation(
     geo_provider: str,
     geo_timeout: float,
     geo_max_concurrent: int,
+    geo_requests_per_second: float | None,
     detail_output: Path | None,
     schemes: tuple[str, ...],
     sqlite_db: Path | None = None,
@@ -729,6 +733,11 @@ async def run_validation(
     connector = aiohttp.TCPConnector(limit=connector_limit, limit_per_host=limit_per_host)
     semaphore = asyncio.Semaphore(max_connections)
     rate_limiter = AsyncRateLimiter(requests_per_second) if requests_per_second is not None else None
+    geo_rate_limiter = (
+        AsyncRateLimiter(geo_requests_per_second)
+        if enable_geo and geo_requests_per_second is not None
+        else None
+    )
 
     judge_urls = [item.strip() for item in judge_url.split(",") if item.strip()]
     if not judge_urls:
@@ -847,6 +856,7 @@ async def run_validation(
                     provider=geo_provider,
                     timeout_seconds=geo_timeout,
                     max_concurrent=geo_max_concurrent,
+                    rate_limiter=geo_rate_limiter,
                 )
 
     valid_details.sort(key=lambda d: d.proxy)
@@ -1065,6 +1075,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Concorrencia maxima para geo (default: 10).",
     )
     parser.add_argument(
+        "--geo-requests-per-second",
+        type=float,
+        default=None,
+        help=(
+            "Limite opcional de pedidos/s ao provedor de geo (ex.: 0.75 para ~45/min no ip-api gratuito). "
+            "Combina com -K; aplicado apos deduplicar origin_ip."
+        ),
+    )
+    parser.add_argument(
         "-d",
         "--detail-output",
         type=Path,
@@ -1088,6 +1107,7 @@ def validate_args(
     write_mode: str,
     geo_timeout: float,
     geo_max_concurrent: int,
+    geo_requests_per_second: float | None,
     try_socks: bool,
 ) -> None:
     if workers <= 0:
@@ -1104,6 +1124,8 @@ def validate_args(
         raise ValueError("--geo-timeout deve ser > 0.")
     if geo_max_concurrent <= 0:
         raise ValueError("--geo-max-concurrent deve ser > 0.")
+    if geo_requests_per_second is not None and geo_requests_per_second <= 0:
+        raise ValueError("--geo-requests-per-second deve ser > 0.")
     if try_socks and not SOCKS_AVAILABLE:
         raise RuntimeError("SOCKS requer aiohttp-socks. Instale: pip install aiohttp-socks")
 
@@ -1121,6 +1143,7 @@ async def async_main() -> int:
             args.write_mode,
             args.geo_timeout,
             args.geo_max_concurrent,
+            args.geo_requests_per_second,
             args.try_socks,
         )
         schemes = build_proxy_schemes(args.try_socks)
@@ -1140,6 +1163,7 @@ async def async_main() -> int:
             geo_provider=args.geo_provider,
             geo_timeout=args.geo_timeout,
             geo_max_concurrent=args.geo_max_concurrent,
+            geo_requests_per_second=args.geo_requests_per_second,
             detail_output=args.detail_output,
             schemes=schemes,
             sqlite_db=args.sqlite_db,

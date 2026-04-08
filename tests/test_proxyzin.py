@@ -40,6 +40,21 @@ def test_pick_primary_origin_ip() -> None:
     assert proxyzin.pick_primary_origin_ip({"10.0.0.2", "10.0.0.1"}) == "10.0.0.1"
 
 
+def test_validate_geo_requests_per_second_rejects_non_positive() -> None:
+    with pytest.raises(ValueError, match="geo-requests-per-second"):
+        proxyzin.validate_args(
+            workers=1,
+            max_connections=1,
+            timeout_seconds=8.0,
+            requests_per_second=None,
+            write_mode="append",
+            geo_timeout=3.0,
+            geo_max_concurrent=10,
+            geo_requests_per_second=0.0,
+            try_socks=False,
+        )
+
+
 def test_resolve_source_urls_fallback() -> None:
     assert proxyzin.resolve_source_urls(None, []) == [proxyzin.PROXYSCRAPE_URL]
 

@@ -358,9 +358,9 @@ async def fetch_geo_location(
             city = str(data.get("city", "") or "").strip()
             parts = [p for p in (country, region, city) if p]
             return ", ".join(parts) if parts else "unknown"
+        return "unknown"
     except Exception:
         return "unknown"
-    return "unknown"
 
 
 async def apply_geo_to_details(
@@ -372,13 +372,20 @@ async def apply_geo_to_details(
 ) -> None:
     if not details:
         return
+    unique_ips = sorted({d.origin_ip for d in details if d.origin_ip})
+    if not unique_ips:
+        return
     sem = asyncio.Semaphore(max(1, max_concurrent))
 
-    async def one(d: ValidProxyDetail) -> None:
+    async def resolve_ip(ip: str) -> tuple[str, str]:
         async with sem:
-            d.location = await fetch_geo_location(session, d.origin_ip, provider, timeout_seconds)
+            loc = await fetch_geo_location(session, ip, provider, timeout_seconds)
+        return ip, loc
 
-    await asyncio.gather(*(one(d) for d in details))
+    pairs = await asyncio.gather(*(resolve_ip(ip) for ip in unique_ips))
+    ip_to_loc = dict(pairs)
+    for d in details:
+        d.location = ip_to_loc.get(d.origin_ip, "unknown")
 
 
 async def validate_with_scheme(
@@ -716,8 +723,10 @@ async def run_validation(
             "[bold]ProxyZin[/bold] — validador assincrono de proxies HTTP, HTTPS e SOCKS (opcional)\n"
         )
     timeout = ClientTimeout(total=timeout_seconds)
-    # Concurrency is controlled by semaphore only; connector keeps defaults.
-    connector = aiohttp.TCPConnector()
+    geo_headroom = geo_max_concurrent if enable_geo else 0
+    connector_limit = max(max_connections + geo_headroom + 32, 64)
+    limit_per_host = max(max_connections, 1)
+    connector = aiohttp.TCPConnector(limit=connector_limit, limit_per_host=limit_per_host)
     semaphore = asyncio.Semaphore(max_connections)
     rate_limiter = AsyncRateLimiter(requests_per_second) if requests_per_second is not None else None
 
@@ -840,7 +849,9 @@ async def run_validation(
                     max_concurrent=geo_max_concurrent,
                 )
 
+    valid_details.sort(key=lambda d: d.proxy)
     if write_mode == "final":
+        valid_proxies.sort()
         output_file.write_text("\n".join(valid_proxies) + ("\n" if valid_proxies else ""), encoding="utf-8")
 
     if detail_output is not None:

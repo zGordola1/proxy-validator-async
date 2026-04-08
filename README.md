@@ -160,6 +160,10 @@ O repositório inclui [`.github/workflows/ci.yml`](.github/workflows/ci.yml): em
 3. **Juiz (`-j`)** — O default (`httpbin.org/ip`) pode sofrer **rate limit** ou indisponibilidade. Podes passar **vários** endpoints separados por vírgula; o baseline e os testes fazem rotação/fallback. O juiz tem de devolver **JSON com campo `origin`** no mesmo estilo do httpbin; APIs só com `ip` (ex. ipify) **não** são compatíveis sem alterar o código.
 4. **SOCKS** — Ver secção SOCKS acima: dependência `aiohttp-socks` e import no arranque.
 
+5. **Saída ordenada** — Antes de gravar CSV (`-d`), SQLite (`--sqlite-db`) e o ficheiro `-o` em modo `final`, as entradas válidas são ordenadas por `proxy` (exportação reproduzível). Em `-m append`, o ficheiro `-o` continua a ser escrito à medida que os proxies passam (ordem de conclusão).
+
+6. **Geo** — IPs de saída repetidos partilham uma única consulta ao provedor (menos chamadas HTTP).
+
 ## Diagnóstico
 
 Motivos comuns de contagem na tabela `rich`: `ok_http`, `ok_https`, `ok_socks4`, `ok_socks5`, `timeout`, `client_error`, `ip_leak_detected`, `judge_blocked_or_non_json`, etc.

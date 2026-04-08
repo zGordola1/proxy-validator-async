@@ -1,25 +1,27 @@
-# Validador avancado de proxies HTTP/HTTPS
+# ProxyZin — validador assíncrono de proxies
 
-Script Python assincrono para coletar proxies gratuitos do ProxyScrape, validar conectividade e anonimato em paralelo e exportar os proxies aprovados.
+Script Python (**ProxyZin**) para coletar proxies de uma ou mais fontes (texto ou JSON), validar **HTTP**, **HTTPS** e opcionalmente **SOCKS4/SOCKS5** com `asyncio` + `aiohttp`, detectar vazamento de IP, exportar resultados e opcionalmente geolocalizar.
+
+**Entrada principal:** `proxyzin.py` (o antigo `proxy_validator.py` foi descontinuado).
 
 ## Recursos
 
-- Coleta automática de proxies via endpoint de texto do ProxyScrape.
-- Processamento concorrente com `asyncio` + `aiohttp`.
-- Limite global de conexoes simultaneas com `asyncio.Semaphore` (default: 100).
-- Juiz de anonimato configuravel via `--judge-url` (um ou varios endpoints, separados por virgula).
-- Limite opcional de taxa com `--requests-per-second` para reduzir rate limit.
-- Barra de progresso no terminal com `rich`.
-- Persistencia incremental (default `--write-mode append`) para evitar perda de progresso.
-- Exportacao dos aprovados em `proxies_validados.txt`.
+- Multi-fonte: `-s` / `--source-url` aceita **várias URLs separadas por vírgula** (listas texto ou JSON estilo Geonode).
+- Validação com juiz configurável (`-j`), rotação/fallback entre juízes e limite de taxa (`-r`).
+- `--try-socks` / `-S`: testa também `socks4` e `socks5` (depende de `aiohttp-socks`).
+- Semáforo global de concorrência, writer incremental (`-m append`) e diagnóstico com `rich`.
+- CSV opcional (`-d`) com `protocol`, `origin_ip`, `location`, `judge_url`.
+- Geo opcional (`-g`) via `ip-api`.
 
 ## Requisitos
 
 - Python 3.10+
 
-## Instalacao rapida
+Dependências: `aiohttp`, `aiohttp-socks`, `rich`.
 
-### Clone via SSH (recomendado)
+## Instalação rápida
+
+### Clone via HTTPS
 
 ```bash
 git clone https://github.com/zGordola1/proxy-validator-async.git
@@ -27,92 +29,82 @@ cd proxy-validator-async
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python proxy_validator.py --help
-
-## Uso
-
-Execução padrão:
-
-```bash
-python proxy_validator.py
+python proxyzin.py --help
 ```
 
-Com parâmetros:
+No Windows (PowerShell), ative o venv com: `.venv\Scripts\activate`
+
+### Clone via SSH
 
 ```bash
-python proxy_validator.py --workers 50 --max-connections 100 --timeout 8 --output proxies_validados.txt
+git clone git@github.com:zGordola1/proxy-validator-async.git
+cd proxy-validator-async
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python proxyzin.py --help
 ```
 
-## Argumentos
-
-- `--workers`: quantidade de workers assincronos (default: `50`)
-- `--max-connections`: limite global de conexoes simultaneas (default: `100`)
-- `--timeout`: timeout por request em segundos (intervalo permitido: `5` a `10`, default: `8`)
-- `--output`: arquivo de saida dos proxies validados (default: `proxies_validados.txt`)
-- `--source-url`: URL da fonte de proxies (default: ProxyScrape HTTP list)
-- `--judge-url`: endpoint(s) do juiz para validar IP de saida, separados por virgula
-- `--requests-per-second`: limite opcional de taxa de requests contra o juiz
-- `--write-mode`: modo de escrita do output (`append` ou `final`, default: `append`)
-
-## Como a validacao funciona
-
-1. Busca lista de proxies (`host:port`) no ProxyScrape.
-2. Descobre seu IP baseline sem proxy consultando a lista de juizes em fallback.
-3. Testa cada proxy com esquemas `http://` e `https://`.
-4. Considera valido somente quando:
-   - resposta HTTP for 200;
-   - JSON de resposta tiver `origin` parseavel;
-   - IP visto pelo httpbin for diferente do IP baseline local.
-5. Salva proxies aprovados no arquivo de saida:
-   - em tempo real no modo `append`;
-   - ao final no modo `final`.
-6. Exibe diagnostico operacional com:
-   - motivos de sucesso/falha;
-   - taxa de sucesso por esquema (`ok_http`/`ok_https`);
-   - telemetria por juiz (success/fail/rate);
-   - estatisticas de espera do rate limiter.
-
-## Observacoes
-
-- Proxies gratuitos sao altamente instaveis; e normal baixa taxa de aprovacao.
-- Caso `timeout` seja muito baixo, falsos negativos podem aumentar.
-- Em juiz publico (`httpbin`), prefira iniciar com `--workers 20 --max-connections 30`.
-- Para reduzir bloqueios, combine com `--requests-per-second 10` (ou valor menor).
-- Em execucoes longas, use `--write-mode append` para nao perder resultados em interrupcao.
-
-## Exemplos recomendados
-
-Uso robusto em juiz publico:
+## Uso rápido
 
 ```bash
-python proxy_validator.py --workers 20 --max-connections 30 --requests-per-second 10 --write-mode append
+python proxyzin.py --help
 ```
 
-Uso com juiz proprio:
+Exemplo com atalhos:
 
 ```bash
-python proxy_validator.py --judge-url http://seu-endpoint/ip --workers 30 --max-connections 50 --requests-per-second 15
+python proxyzin.py -w 20 -c 30 -t 8 -o proxies_validados.txt -r 10 -m append
 ```
 
-Uso com juiz rotativo:
+## Atalhos da CLI
+
+| Atalho | Opção longa |
+|--------|-------------|
+| `-w` | `--workers` |
+| `-c` | `--max-connections` |
+| `-t` | `--timeout` |
+| `-o` | `--output` |
+| `-s` | `--source-url` |
+| `-j` | `--judge-url` |
+| `-r` | `--requests-per-second` |
+| `-m` | `--write-mode` |
+| `-S` | `--try-socks` |
+| `-q` | `--no-banner` |
+| `-g` | `--enable-geo` |
+| `-P` | `--geo-provider` |
+| `-y` | `--geo-timeout` |
+| `-K` | `--geo-max-concurrent` |
+| `-d` | `--detail-output` |
+
+## Multi-fonte (texto + JSON)
+
+Mesclagem sem duplicar `host:port`:
 
 ```bash
-python proxy_validator.py --judge-url "http://seu-juiz-1/ip,http://seu-juiz-2/ip" --workers 25 --requests-per-second 8
+python proxyzin.py -s "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all,https://proxylist.geonode.com/api/proxy?limit=200&page=1&sort_by=lastChecked&sort_type=desc"
 ```
 
-## Diagnostico operacional
+## SOCKS4 / SOCKS5
 
-Ao final da execucao, o script imprime tabelas com distribuicao por `reason`, sucesso por esquema e telemetria por juiz.
+```bash
+python proxyzin.py -S -w 20 -r 8
+```
 
-Interpretacao rapida dos principais motivos:
+## Geolocalização e CSV
 
-- `ok_http` / `ok_https`: proxy aprovado no juiz.
-- `timeout`: proxy nao respondeu dentro do timeout configurado.
-- `client_error`: erro de conexao/protocolo com o proxy.
-- `status_non_200`: juiz respondeu com status diferente de 200.
-- `invalid_json`: resposta nao estava no formato JSON esperado.
-- `judge_blocked_or_non_json`: bloqueio/rate limit no juiz ou resposta HTML inesperada.
-- `empty_origin`: juiz respondeu sem IP util em `origin`.
-- `ip_leak_detected`: vazamento de IP baseline local (proxy transparente).
+```bash
+python proxyzin.py -g -d proxies_validados_detalhado.csv -y 3 -K 8
+```
 
-Use esse resumo para ajustar `--timeout`, `--requests-per-second`, `--workers` e `--judge-url`.
+## Fluxo de validação
+
+1. Baixa e unifica listas das URLs em `-s`.
+2. Obtém IP baseline sem proxy (fallback entre juízes em `-j`).
+3. Para cada proxy, testa `http` e `https` (e, com `-S`, `socks4` e `socks5`).
+4. Aprova se HTTP 200, JSON com `origin` parseável e sem vazamento do baseline.
+5. Persiste linhas aprovadas em `-o`; opcionalmente CSV em `-d` e geo com `-g`.
+
+## Diagnóstico
+
+Motivos comuns: `ok_http`, `ok_https`, `ok_socks4`, `ok_socks5`, `timeout`, `client_error`, `ip_leak_detected`, `judge_blocked_or_non_json`, etc.

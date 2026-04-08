@@ -3,4 +3,5 @@ __pycache__/
 venv/
 .env
 proxies_validados.txt
+proxies_validados_detalhado.csv
 *.pyc

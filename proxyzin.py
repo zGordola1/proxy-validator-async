@@ -5,7 +5,9 @@ import asyncio
 import csv
 import ipaddress
 import json
+import sqlite3
 from collections import Counter
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -231,6 +233,36 @@ async def fetch_proxies_from_sources(session: ClientSession, source_urls: list[s
                 continue
             unique.add(proxy)
             merged.append(proxy)
+    return merged
+
+
+def load_source_urls_from_files(paths: list[Path]) -> list[str]:
+    """Uma URL por linha; linhas vazias e comentarios (#) ignorados."""
+    urls: list[str] = []
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Ficheiro de fontes nao encontrado: {path.as_posix()}")
+        for line in path.read_text(encoding="utf-8").splitlines():
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            urls.append(raw)
+    return urls
+
+
+def resolve_source_urls(source_csv: str | None, file_paths: list[Path]) -> list[str]:
+    """Merge -s (CSV) com URLs de ficheiros; dedupe preservando ordem; fallback ProxyScrape."""
+    from_csv = [u.strip() for u in source_csv.split(",") if u.strip()] if source_csv else []
+    from_files = load_source_urls_from_files(file_paths) if file_paths else []
+    seen: set[str] = set()
+    merged: list[str] = []
+    for u in from_csv + from_files:
+        if u in seen:
+            continue
+        seen.add(u)
+        merged.append(u)
+    if not merged:
+        return [PROXYSCRAPE_URL]
     return merged
 
 
@@ -587,12 +619,53 @@ def write_valid_details_csv(path: Path, rows: list[ValidProxyDetail]) -> None:
             writer.writerow([row.proxy, row.protocol, row.origin_ip, row.location, row.judge_url])
 
 
+def upsert_validated_sqlite(db_path: Path, rows: list[ValidProxyDetail]) -> int:
+    """UPSERT alinhado ao CSV detalhado; retorna numero de linhas processadas."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    validated_at = datetime.now(timezone.utc).isoformat()
+    params = [
+        (row.proxy, row.protocol, row.origin_ip, row.location, row.judge_url, validated_at)
+        for row in rows
+    ]
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS validated_proxies (
+                proxy TEXT PRIMARY KEY,
+                protocol TEXT NOT NULL,
+                origin_ip TEXT NOT NULL,
+                location TEXT NOT NULL,
+                judge_url TEXT NOT NULL,
+                validated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO validated_proxies (proxy, protocol, origin_ip, location, judge_url, validated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(proxy) DO UPDATE SET
+                protocol = excluded.protocol,
+                origin_ip = excluded.origin_ip,
+                location = excluded.location,
+                judge_url = excluded.judge_url,
+                validated_at = excluded.validated_at
+            """,
+            params,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(rows)
+
+
 async def run_validation(
     workers: int,
     max_connections: int,
     timeout_seconds: float,
     output_file: Path,
-    source_url: str,
+    source_urls: list[str],
     judge_url: str,
     requests_per_second: float | None,
     write_mode: str,
@@ -603,6 +676,7 @@ async def run_validation(
     geo_max_concurrent: int,
     detail_output: Path | None,
     schemes: tuple[str, ...],
+    sqlite_db: Path | None = None,
 ) -> None:
     console = Console()
     if not no_banner:
@@ -621,10 +695,6 @@ async def run_validation(
         raise ValueError("Ao menos um judge-url valido deve ser informado.")
     judge_picker = JudgePicker(judge_urls=judge_urls)
     valid_details: list[ValidProxyDetail] = []
-
-    source_urls = [u.strip() for u in source_url.split(",") if u.strip()]
-    if not source_urls:
-        source_urls = [PROXYSCRAPE_URL]
 
     async with ClientSession(timeout=timeout, connector=connector) as session:
         console.print("[bold cyan]ProxyZin:[/bold cyan] Baixando proxies...")
@@ -740,6 +810,12 @@ async def run_validation(
 
     if detail_output is not None:
         write_valid_details_csv(detail_output, valid_details)
+
+    if sqlite_db is not None:
+        n_sql = upsert_validated_sqlite(sqlite_db, valid_details)
+        console.print(
+            f"[bold cyan]SQLite:[/bold cyan] {sqlite_db.as_posix()} — {n_sql} registro(s) gravados."
+        )
 
     persisted_total = persisted_counter["count"] if write_mode == "append" else len(valid_proxies)
     detail_msg = f" | Detalhado: {detail_output.as_posix()}" if detail_output is not None else ""
@@ -866,11 +942,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-s",
         "--source-url",
         type=str,
-        default=PROXYSCRAPE_URL,
+        default=None,
         help=(
             "Uma ou mais URLs de lista (texto ou JSON Geonode), separadas por virgula. "
+            "Se omitido e sem --sources-file, usa a fonte default ProxyScrape. "
             f"Exemplo extra: {PROXY_GEONODE_SAMPLE}"
         ),
+    )
+    parser.add_argument(
+        "--sources-file",
+        action="append",
+        type=Path,
+        default=None,
+        help="Ficheiro com uma URL por linha (# comentarios e linhas vazias ignoradas). Repetir para varios ficheiros.",
     )
     parser.add_argument(
         "-j",
@@ -941,6 +1025,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="CSV: proxy, protocol, origin_ip, location, judge_url.",
     )
+    parser.add_argument(
+        "--sqlite-db",
+        type=Path,
+        default=None,
+        help="SQLite: guardar ou atualizar proxies validos (mesmos campos que o CSV detalhado).",
+    )
     return parser
 
 
@@ -988,12 +1078,14 @@ async def async_main() -> int:
             args.try_socks,
         )
         schemes = build_proxy_schemes(args.try_socks)
+        source_files = args.sources_file if args.sources_file is not None else []
+        source_urls = resolve_source_urls(args.source_url, source_files)
         await run_validation(
             workers=args.workers,
             max_connections=args.max_connections,
             timeout_seconds=args.timeout,
             output_file=args.output,
-            source_url=args.source_url,
+            source_urls=source_urls,
             judge_url=args.judge_url,
             requests_per_second=args.requests_per_second,
             write_mode=args.write_mode,
@@ -1004,6 +1096,7 @@ async def async_main() -> int:
             geo_max_concurrent=args.geo_max_concurrent,
             detail_output=args.detail_output,
             schemes=schemes,
+            sqlite_db=args.sqlite_db,
         )
         return 0
     except KeyboardInterrupt:

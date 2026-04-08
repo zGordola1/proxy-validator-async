@@ -22,7 +22,7 @@ Script Python assincrono para coletar proxies gratuitos do ProxyScrape, validar 
 ### Clone via SSH (recomendado)
 
 ```bash
-git clone git@github.com:zGordola1/proxy-validator-async.git
+git clone https://github.com/zGordola1/proxy-validator-async.git
 cd proxy-validator-async
 python3 -m venv .venv
 source .venv/bin/activate

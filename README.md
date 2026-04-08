@@ -177,3 +177,9 @@ O repositório inclui [`.github/workflows/ci.yml`](.github/workflows/ci.yml): em
 ## Diagnóstico
 
 Motivos comuns de contagem na tabela `rich`: `ok_http`, `ok_https`, `ok_socks4`, `ok_socks5`, `timeout`, `client_error`, `ip_leak_detected`, `judge_blocked_or_non_json`, etc.
+
+## Licença
+
+Este projeto está sob a licença **MIT** — ver o ficheiro [LICENSE](LICENSE). Podes usar, modificar e distribuir o código conforme os termos da licença.
+
+No GitHub, em **Settings → General → License**, podes confirmar que o repositório está associado à MIT (o ficheiro `LICENSE` na raiz é normalmente detetado automaticamente).

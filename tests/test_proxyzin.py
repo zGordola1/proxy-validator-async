@@ -84,6 +84,12 @@ def test_country_code_for_output() -> None:
     assert proxyzin.country_code_for_output("GB") == "UK"
 
 
+def test_reason_display_label() -> None:
+    assert proxyzin.reason_display_label("ok_http") == "HTTP"
+    assert proxyzin.reason_display_label("ok_socks5") == "SOCKS5"
+    assert proxyzin.reason_display_label("timeout") == "timeout"
+
+
 def test_validate_geo_requests_per_second_rejects_non_positive() -> None:
     with pytest.raises(ValueError, match="geo-requests-per-second"):
         proxyzin.validate_args(

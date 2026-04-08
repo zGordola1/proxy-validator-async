@@ -11,7 +11,7 @@ Script Python (**ProxyZin**) para coletar proxies de uma ou mais fontes (texto o
 - Persistência opcional em **SQLite** (`--sqlite-db`), alinhada ao CSV detalhado (UPSERT por `proxy`).
 - Validação com juiz configurável (`-j`), rotação/fallback entre juízes e limite de taxa (`-r`).
 - `--try-socks` / `-S`: testa também `socks4` e `socks5` (depende de `aiohttp-socks`).
-- Semáforo global de concorrência e diagnóstico com `rich` (inclui resumo de motivos e protocolos).
+- Semáforo global de concorrência e diagnóstico com `rich`: **Resumo do Diagnóstico Operacional** e **Protocolos válidos** mostram sempre HTTP/HTTPS/SOCKS4/SOCKS5 (sucessos com rótulo legível, não só `ok_*`).
 - CSV opcional (`-d`) com `protocol`, `origin_ip`, `location`, `country_code`, `judge_url`.
 - Geo opcional (`-g`) via `ip-api` (campo `countryCode` para o sufixo no `-o`).
 

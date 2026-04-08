@@ -101,6 +101,13 @@ def country_code_for_output(country_code: str) -> str:
     return ISO_COUNTRY_OVERRIDES.get(code, code)
 
 
+def reason_display_label(reason: str) -> str:
+    """Rotulo legivel no resumo diagnostico: ok_http -> HTTP; falhas mantem o codigo."""
+    if reason.startswith("ok_"):
+        return REASON_PROTOCOL_LABELS.get(reason, reason)
+    return reason
+
+
 def format_output_line(detail: ValidProxyDetail, enable_geo: bool) -> str:
     """Linha para -o: host:port PROTOCOLO ou com -g: host:port ISO PROTOCOLO."""
     label = protocol_display_label(detail.protocol)
@@ -887,7 +894,7 @@ async def run_validation(
     for reason, count in ordered_items:
         category = "Sucesso" if reason.startswith(success_prefix) else "Falha"
         ratio = (count / total_reasons * 100.0) if total_reasons else 0.0
-        diagnostics.add_row(category, reason, str(count), f"{ratio:.1f}%")
+        diagnostics.add_row(category, reason_display_label(reason), str(count), f"{ratio:.1f}%")
     console.print(diagnostics)
 
     scheme_table = Table(

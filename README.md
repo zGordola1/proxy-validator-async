@@ -6,13 +6,14 @@ Script Python (**ProxyZin**) para coletar proxies de uma ou mais fontes (texto o
 
 ## Recursos
 
-- Multi-fonte: `-s` / `--source-url` aceita **várias URLs separadas por vírgula** (listas texto ou JSON estilo Geonode); `--sources-file` lê **uma URL por linha** (comentários `#` e linhas vazias ignorados).
+- Multi-fonte: `-s` / `--source-url` define **de onde baixar** as listas de proxies (URLs separadas por vírgula; texto ou JSON estilo Geonode); **não** aparece no ficheiro `-o` — o que conta na saída é cada proxy validado e o **protocolo** que funcionou.
+- Saída principal (`-o`): uma linha por proxy válido no formato `host:port PROTOCOLO` (ex.: `37.187.92.9:1029 SOCKS5`); com `-g`, acrescenta país curto (ex.: `EUA` quando o código ISO é `US`).
 - Persistência opcional em **SQLite** (`--sqlite-db`), alinhada ao CSV detalhado (UPSERT por `proxy`).
 - Validação com juiz configurável (`-j`), rotação/fallback entre juízes e limite de taxa (`-r`).
 - `--try-socks` / `-S`: testa também `socks4` e `socks5` (depende de `aiohttp-socks`).
-- Semáforo global de concorrência, writer incremental (`-m append`) e diagnóstico com `rich`.
-- CSV opcional (`-d`) com `protocol`, `origin_ip`, `location`, `judge_url`.
-- Geo opcional (`-g`) via `ip-api`.
+- Semáforo global de concorrência e diagnóstico com `rich` (inclui resumo de motivos e protocolos).
+- CSV opcional (`-d`) com `protocol`, `origin_ip`, `location`, `country_code`, `judge_url`.
+- Geo opcional (`-g`) via `ip-api` (campo `countryCode` para o sufixo no `-o`).
 
 ## Requisitos
 
@@ -168,11 +169,13 @@ O repositório inclui [`.github/workflows/ci.yml`](.github/workflows/ci.yml): em
 3. **Juiz (`-j`)** — O default (`httpbin.org/ip`) pode sofrer **rate limit** ou indisponibilidade. Podes passar **vários** endpoints separados por vírgula; o baseline e os testes fazem rotação/fallback. O juiz tem de devolver **JSON com campo `origin`** no mesmo estilo do httpbin; APIs só com `ip` (ex. ipify) **não** são compatíveis sem alterar o código.
 4. **SOCKS** — Ver secção SOCKS acima: dependência `aiohttp-socks` e import no arranque.
 
-5. **Saída ordenada** — Antes de gravar CSV (`-d`), SQLite (`--sqlite-db`) e o ficheiro `-o` em modo `final`, as entradas válidas são ordenadas por `proxy` (exportação reproduzível). Em `-m append`, o ficheiro `-o` continua a ser escrito à medida que os proxies passam (ordem de conclusão).
+5. **Saída ordenada** — As entradas válidas são ordenadas por `proxy` antes de gravar `-o`, CSV e SQLite. O ficheiro `-o` é escrito **no fim** da corrida (com protocolo e, se `-g`, país curto), para incluir geo sem reescrever linhas a meio.
 
 6. **Geo** — IPs de saída repetidos partilham uma única consulta ao provedor (menos chamadas HTTP). O **ip-api** gratuito tem teto ~**45 req/min**; usa `-K` baixo e opcionalmente `--geo-requests-per-second` (ex. `0.75`) para evitar bloqueios temporários e respostas `unknown`.
 
-7. **`requirements.txt`** — As dependências (`aiohttp`, `aiohttp-socks`, `rich`) estão declaradas explicitamente; não é necessário `pip freeze` para SOCKS: basta `pip install -r requirements.txt`. Com `-S` sem `aiohttp-socks`, o programa avisa com erro claro.
+7. **`-m` append/final** — Mantido por compatibilidade; em ambos os casos o `-o` é preenchido ao **terminar** (formato enriquecido com protocolo e opcionalmente país).
+
+8. **`requirements.txt`** — As dependências (`aiohttp`, `aiohttp-socks`, `rich`) estão declaradas explicitamente; não é necessário `pip freeze` para SOCKS: basta `pip install -r requirements.txt`. Com `-S` sem `aiohttp-socks`, o programa avisa com erro claro.
 
 ## Diagnóstico
 

@@ -48,6 +48,25 @@ REASON_PROTOCOL_LABELS: Final[dict[str, str]] = {
     "ok_socks4": "SOCKS4",
     "ok_socks5": "SOCKS5",
 }
+# Rotulos curtos para saida -o (ex.: EUA = Estados Unidos em PT).
+COUNTRY_CODE_DISPLAY: Final[dict[str, str]] = {
+    "US": "EUA",
+    "GB": "UK",
+    "BR": "Brasil",
+    "PT": "PT",
+    "ES": "Espanha",
+    "DE": "Alemanha",
+    "FR": "Franca",
+    "IT": "Italia",
+    "NL": "Holanda",
+    "JP": "JP",
+    "CN": "CN",
+    "RU": "RU",
+    "IN": "India",
+    "CA": "CA",
+    "AU": "AU",
+    "MX": "MX",
+}
 WRITE_MODES: Final[set[str]] = {"append", "final"}
 GEO_PROVIDERS: Final[set[str]] = {"ip-api"}
 
@@ -82,6 +101,34 @@ class ValidProxyDetail:
     origin_ip: str
     judge_url: str
     location: str = "unknown"
+    country_code: str = ""
+
+
+def protocol_display_label(protocol: str) -> str:
+    """HTTP, HTTPS, SOCKS4, SOCKS5 a partir do scheme (ex.: socks5)."""
+    key = f"ok_{protocol}"
+    return REASON_PROTOCOL_LABELS.get(key, protocol.upper())
+
+
+def country_short_display(country_code: str) -> str:
+    code = country_code.strip().upper()
+    if not code:
+        return ""
+    return COUNTRY_CODE_DISPLAY.get(code, code)
+
+
+def format_output_line(detail: ValidProxyDetail, enable_geo: bool) -> str:
+    """Linha para -o: host:port PROTOCOLO [PAIS]."""
+    label = protocol_display_label(detail.protocol)
+    if not enable_geo:
+        return f"{detail.proxy} {label}"
+    cc = detail.country_code.strip()
+    if cc:
+        return f"{detail.proxy} {label} {country_short_display(cc)}"
+    if detail.location and detail.location != "unknown":
+        first = detail.location.split(",")[0].strip()
+        return f"{detail.proxy} {label} {first}"
+    return f"{detail.proxy} {label} unknown"
 
 
 class AsyncRateLimiter:
@@ -341,26 +388,32 @@ async def fetch_geo_location(
     ip: str,
     provider: str,
     timeout_seconds: float,
-) -> str:
-    """Resolve location string for an IP; never raises (returns unknown on failure)."""
+) -> tuple[str, str]:
+    """Resolve localizacao e codigo ISO do pais; nunca levanta (unknown, '')."""
     timeout = ClientTimeout(total=timeout_seconds)
     try:
         if provider == "ip-api":
             url = f"http://ip-api.com/json/{ip}"
-            async with session.get(url, params={"fields": "status,country,regionName,city"}, timeout=timeout) as resp:
+            async with session.get(
+                url,
+                params={"fields": "status,country,countryCode,regionName,city"},
+                timeout=timeout,
+            ) as resp:
                 if resp.status != 200:
-                    return "unknown"
+                    return "unknown", ""
                 data = await resp.json(content_type=None)
             if str(data.get("status", "")).lower() != "success":
-                return "unknown"
+                return "unknown", ""
             country = str(data.get("country", "") or "").strip()
+            country_code = str(data.get("countryCode", "") or "").strip()
             region = str(data.get("regionName", "") or "").strip()
             city = str(data.get("city", "") or "").strip()
             parts = [p for p in (country, region, city) if p]
-            return ", ".join(parts) if parts else "unknown"
-        return "unknown"
+            loc = ", ".join(parts) if parts else "unknown"
+            return loc, country_code
+        return "unknown", ""
     except Exception:
-        return "unknown"
+        return "unknown", ""
 
 
 async def apply_geo_to_details(
@@ -378,17 +431,22 @@ async def apply_geo_to_details(
         return
     sem = asyncio.Semaphore(max(1, max_concurrent))
 
-    async def resolve_ip(ip: str) -> tuple[str, str]:
+    async def resolve_ip(ip: str) -> tuple[str, str, str]:
         if rate_limiter is not None:
             await rate_limiter.wait_turn()
         async with sem:
-            loc = await fetch_geo_location(session, ip, provider, timeout_seconds)
-        return ip, loc
+            loc, cc = await fetch_geo_location(session, ip, provider, timeout_seconds)
+        return ip, loc, cc
 
-    pairs = await asyncio.gather(*(resolve_ip(ip) for ip in unique_ips))
-    ip_to_loc = dict(pairs)
+    triples = await asyncio.gather(*(resolve_ip(ip) for ip in unique_ips))
+    ip_to_loc: dict[str, str] = {}
+    ip_to_cc: dict[str, str] = {}
+    for ip, loc, cc in triples:
+        ip_to_loc[ip] = loc
+        ip_to_cc[ip] = cc
     for d in details:
         d.location = ip_to_loc.get(d.origin_ip, "unknown")
+        d.country_code = ip_to_cc.get(d.origin_ip, "")
 
 
 async def validate_with_scheme(
@@ -540,43 +598,12 @@ async def validate_proxy(
     return last_result, attempts, rate_wait_events, rate_wait_total_ms
 
 
-async def append_proxy_async(file_path: Path, proxy: str) -> None:
-    line = f"{proxy}\n"
-    await asyncio.to_thread(_append_proxy_sync, file_path, line)
-
-
-def _append_proxy_sync(file_path: Path, line: str) -> None:
-    with file_path.open("a", encoding="utf-8") as handle:
-        handle.write(line)
-
-
-async def writer_worker(
-    file_path: Path,
-    writer_queue: asyncio.Queue[str | None],
-    persisted_counter: dict[str, int],
-    persisted_lock: asyncio.Lock,
-) -> None:
-    while True:
-        item = await writer_queue.get()
-        try:
-            if item is None:
-                return
-            await append_proxy_async(file_path, item)
-            async with persisted_lock:
-                persisted_counter["count"] += 1
-        finally:
-            writer_queue.task_done()
-
-
 async def worker(
     queue: asyncio.Queue[str],
     session: ClientSession,
     baseline_ips: set[str],
     timeout_seconds: float,
     semaphore: asyncio.Semaphore,
-    valid_proxies: list[str],
-    write_mode: str,
-    writer_queue: asyncio.Queue[str | None] | None,
     state_lock: asyncio.Lock,
     progress: Progress,
     task_id: TaskID,
@@ -628,11 +655,6 @@ async def worker(
                             location=result.location,
                         )
                     )
-                    if write_mode == "append":
-                        if writer_queue is not None:
-                            writer_queue.put_nowait(result.proxy)
-                    else:
-                        valid_proxies.append(result.proxy)
                 else:
                     counters["invalid"] += 1
 
@@ -655,9 +677,11 @@ def write_valid_details_csv(path: Path, rows: list[ValidProxyDetail]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["proxy", "protocol", "origin_ip", "location", "judge_url"])
+        writer.writerow(["proxy", "protocol", "origin_ip", "location", "country_code", "judge_url"])
         for row in rows:
-            writer.writerow([row.proxy, row.protocol, row.origin_ip, row.location, row.judge_url])
+            writer.writerow(
+                [row.proxy, row.protocol, row.origin_ip, row.location, row.country_code, row.judge_url]
+            )
 
 
 def upsert_validated_sqlite(db_path: Path, rows: list[ValidProxyDetail]) -> int:
@@ -665,7 +689,7 @@ def upsert_validated_sqlite(db_path: Path, rows: list[ValidProxyDetail]) -> int:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     validated_at = datetime.now(timezone.utc).isoformat()
     params = [
-        (row.proxy, row.protocol, row.origin_ip, row.location, row.judge_url, validated_at)
+        (row.proxy, row.protocol, row.origin_ip, row.location, row.country_code, row.judge_url, validated_at)
         for row in rows
     ]
     conn = sqlite3.connect(db_path)
@@ -677,19 +701,25 @@ def upsert_validated_sqlite(db_path: Path, rows: list[ValidProxyDetail]) -> int:
                 protocol TEXT NOT NULL,
                 origin_ip TEXT NOT NULL,
                 location TEXT NOT NULL,
+                country_code TEXT NOT NULL DEFAULT '',
                 judge_url TEXT NOT NULL,
                 validated_at TEXT NOT NULL
             )
             """
         )
+        try:
+            conn.execute("ALTER TABLE validated_proxies ADD COLUMN country_code TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         conn.executemany(
             """
-            INSERT INTO validated_proxies (proxy, protocol, origin_ip, location, judge_url, validated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO validated_proxies (proxy, protocol, origin_ip, location, country_code, judge_url, validated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(proxy) DO UPDATE SET
                 protocol = excluded.protocol,
                 origin_ip = excluded.origin_ip,
                 location = excluded.location,
+                country_code = excluded.country_code,
                 judge_url = excluded.judge_url,
                 validated_at = excluded.validated_at
             """,
@@ -709,7 +739,7 @@ async def run_validation(
     source_urls: list[str],
     judge_url: str,
     requests_per_second: float | None,
-    write_mode: str,
+    _write_mode: str,
     no_banner: bool,
     enable_geo: bool,
     geo_provider: str,
@@ -772,23 +802,6 @@ async def run_validation(
         for proxy in proxies:
             queue.put_nowait(proxy)
 
-        valid_proxies: list[str] = []
-        if write_mode == "append":
-            output_file.write_text("", encoding="utf-8")
-        writer_queue: asyncio.Queue[str | None] | None = asyncio.Queue() if write_mode == "append" else None
-        persisted_counter = {"count": 0}
-        persisted_lock = asyncio.Lock()
-        writer_task: asyncio.Task[None] | None = None
-        if writer_queue is not None:
-            writer_task = asyncio.create_task(
-                writer_worker(
-                    file_path=output_file,
-                    writer_queue=writer_queue,
-                    persisted_counter=persisted_counter,
-                    persisted_lock=persisted_lock,
-                )
-            )
-
         lock = asyncio.Lock()
         counters = {"checked": 0, "valid": 0, "invalid": 0}
         reasons_counter: Counter[str] = Counter()
@@ -816,9 +829,6 @@ async def run_validation(
                         baseline_ips=baseline_ips,
                         timeout_seconds=timeout_seconds,
                         semaphore=semaphore,
-                        valid_proxies=valid_proxies,
-                        write_mode=write_mode,
-                        writer_queue=writer_queue,
                         state_lock=lock,
                         progress=progress,
                         task_id=task_id,
@@ -843,11 +853,6 @@ async def run_validation(
                     task.cancel()
                 await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-                if writer_queue is not None and writer_task is not None:
-                    writer_queue.put_nowait(None)
-                    await writer_queue.join()
-                    await asyncio.gather(writer_task, return_exceptions=False)
-
             if enable_geo and valid_details:
                 console.print("[bold cyan]ProxyZin:[/bold cyan] Geolocalizacao dos IPs validos (direto, sem proxy)...")
                 await apply_geo_to_details(
@@ -860,9 +865,8 @@ async def run_validation(
                 )
 
     valid_details.sort(key=lambda d: d.proxy)
-    if write_mode == "final":
-        valid_proxies.sort()
-        output_file.write_text("\n".join(valid_proxies) + ("\n" if valid_proxies else ""), encoding="utf-8")
+    out_lines = [format_output_line(d, enable_geo) for d in valid_details]
+    output_file.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
 
     if detail_output is not None:
         write_valid_details_csv(detail_output, valid_details)
@@ -873,7 +877,7 @@ async def run_validation(
             f"[bold cyan]SQLite:[/bold cyan] {sqlite_db.as_posix()} — {n_sql} registro(s) gravados."
         )
 
-    persisted_total = persisted_counter["count"] if write_mode == "append" else len(valid_proxies)
+    persisted_total = len(valid_details)
     detail_msg = f" | Detalhado: {detail_output.as_posix()}" if detail_output is not None else ""
     console.print(
         f"[bold green]ProxyZin — Finalizado.[/bold green] Validos: {persisted_total} | "
@@ -923,7 +927,12 @@ async def run_validation(
     console.print(scheme_table)
 
     if enable_geo and valid_details:
-        loc_counter = Counter(d.location for d in valid_details)
+        def _loc_label(d: ValidProxyDetail) -> str:
+            if d.country_code.strip():
+                return country_short_display(d.country_code)
+            return d.location
+
+        loc_counter = Counter(_loc_label(d) for d in valid_details)
         loc_table = Table(
             title="ProxyZin — Top localizacoes (geolocalizacao)",
             show_header=True,
@@ -1032,7 +1041,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="append",
         choices=sorted(WRITE_MODES),
-        help="append (incremental) ou final.",
+        help="append ou final (compatibilidade); o ficheiro -o e escrito no fim com o mesmo formato.",
     )
     parser.add_argument(
         "-S",
@@ -1088,7 +1097,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--detail-output",
         type=Path,
         default=None,
-        help="CSV: proxy, protocol, origin_ip, location, judge_url.",
+        help="CSV: proxy, protocol, origin_ip, location, country_code, judge_url.",
     )
     parser.add_argument(
         "--sqlite-db",
@@ -1157,7 +1166,7 @@ async def async_main() -> int:
             source_urls=source_urls,
             judge_url=args.judge_url,
             requests_per_second=args.requests_per_second,
-            write_mode=args.write_mode,
+            _write_mode=args.write_mode,
             no_banner=args.no_banner,
             enable_geo=args.enable_geo,
             geo_provider=args.geo_provider,

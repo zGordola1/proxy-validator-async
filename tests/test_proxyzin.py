@@ -40,6 +40,29 @@ def test_pick_primary_origin_ip() -> None:
     assert proxyzin.pick_primary_origin_ip({"10.0.0.2", "10.0.0.1"}) == "10.0.0.1"
 
 
+def test_protocol_display_label() -> None:
+    assert proxyzin.protocol_display_label("socks5") == "SOCKS5"
+    assert proxyzin.protocol_display_label("http") == "HTTP"
+
+
+def test_format_output_line() -> None:
+    d = proxyzin.ValidProxyDetail(
+        proxy="37.187.92.9:1029",
+        protocol="socks5",
+        origin_ip="1.1.1.1",
+        judge_url="http://x",
+    )
+    assert proxyzin.format_output_line(d, False) == "37.187.92.9:1029 SOCKS5"
+    d2 = proxyzin.ValidProxyDetail(
+        proxy="37.187.92.9:1029",
+        protocol="socks5",
+        origin_ip="1.1.1.1",
+        judge_url="http://x",
+        country_code="US",
+    )
+    assert proxyzin.format_output_line(d2, True) == "37.187.92.9:1029 SOCKS5 EUA"
+
+
 def test_validate_geo_requests_per_second_rejects_non_positive() -> None:
     with pytest.raises(ValueError, match="geo-requests-per-second"):
         proxyzin.validate_args(

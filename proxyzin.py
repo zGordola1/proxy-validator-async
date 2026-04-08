@@ -48,25 +48,8 @@ REASON_PROTOCOL_LABELS: Final[dict[str, str]] = {
     "ok_socks4": "SOCKS4",
     "ok_socks5": "SOCKS5",
 }
-# Rotulos curtos para saida -o (ex.: EUA = Estados Unidos em PT).
-COUNTRY_CODE_DISPLAY: Final[dict[str, str]] = {
-    "US": "EUA",
-    "GB": "UK",
-    "BR": "Brasil",
-    "PT": "PT",
-    "ES": "Espanha",
-    "DE": "Alemanha",
-    "FR": "Franca",
-    "IT": "Italia",
-    "NL": "Holanda",
-    "JP": "JP",
-    "CN": "CN",
-    "RU": "RU",
-    "IN": "India",
-    "CA": "CA",
-    "AU": "AU",
-    "MX": "MX",
-}
+# ip-api devolve ISO 3166-1 alpha-2; GB exibe-se como UK.
+ISO_COUNTRY_OVERRIDES: Final[dict[str, str]] = {"GB": "UK"}
 WRITE_MODES: Final[set[str]] = {"append", "final"}
 GEO_PROVIDERS: Final[set[str]] = {"ip-api"}
 
@@ -110,25 +93,23 @@ def protocol_display_label(protocol: str) -> str:
     return REASON_PROTOCOL_LABELS.get(key, protocol.upper())
 
 
-def country_short_display(country_code: str) -> str:
+def country_code_for_output(country_code: str) -> str:
+    """Codigo ISO em maiusculas; GB -> UK."""
     code = country_code.strip().upper()
     if not code:
         return ""
-    return COUNTRY_CODE_DISPLAY.get(code, code)
+    return ISO_COUNTRY_OVERRIDES.get(code, code)
 
 
 def format_output_line(detail: ValidProxyDetail, enable_geo: bool) -> str:
-    """Linha para -o: host:port PROTOCOLO [PAIS]."""
+    """Linha para -o: host:port PROTOCOLO ou com -g: host:port ISO PROTOCOLO."""
     label = protocol_display_label(detail.protocol)
     if not enable_geo:
         return f"{detail.proxy} {label}"
     cc = detail.country_code.strip()
     if cc:
-        return f"{detail.proxy} {label} {country_short_display(cc)}"
-    if detail.location and detail.location != "unknown":
-        first = detail.location.split(",")[0].strip()
-        return f"{detail.proxy} {label} {first}"
-    return f"{detail.proxy} {label} unknown"
+        return f"{detail.proxy} {country_code_for_output(cc)} {label}"
+    return f"{detail.proxy} unknown {label}"
 
 
 class AsyncRateLimiter:
@@ -929,7 +910,7 @@ async def run_validation(
     if enable_geo and valid_details:
         def _loc_label(d: ValidProxyDetail) -> str:
             if d.country_code.strip():
-                return country_short_display(d.country_code)
+                return country_code_for_output(d.country_code)
             return d.location
 
         loc_counter = Counter(_loc_label(d) for d in valid_details)
@@ -974,6 +955,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ProxyZin",
         description="ProxyZin — validador assincrono (HTTP/HTTPS/SOCKS), multi-fonte e diagnostico operacional.",
+        epilog=(
+            "Exemplo -o: sem -g «192.168.0.1:8080 HTTP»; com -g «192.168.0.1:8080 BR HTTP» (ISO; GB como UK)."
+        ),
     )
     parser.add_argument(
         "-w",
@@ -1001,7 +985,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         default=Path("proxies_validados.txt"),
-        help="Arquivo de saida com proxies aprovados (host:port).",
+        help=(
+            "Ficheiro de saida: uma linha por proxy valido. "
+            "Se «host:port PROTOCOLO» (HTTP/HTTPS/SOCKS4/SOCKS5). Com -g: «host:port ISO PROTOCOLO» (ex.: BR, US; GB como UK)."
+        ),
     )
     parser.add_argument(
         "-s",
@@ -1059,7 +1046,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "-g",
         "--enable-geo",
         action="store_true",
-        help="Geolocalizacao do IP de saida (direto, sem proxy).",
+        help=(
+            "Geolocalizacao do IP de saida (direto, sem proxy). "
+            "No -o, cada linha fica «host:port ISO PROTOCOLO» (codigo pais ip-api; GB exibido como UK)."
+        ),
     )
     parser.add_argument(
         "-P",
@@ -1178,16 +1168,17 @@ async def async_main() -> int:
             sqlite_db=args.sqlite_db,
         )
         return 0
-    except KeyboardInterrupt:
-        Console().print("[bold yellow]Interrompido pelo usuario.[/bold yellow]")
-        return 130
     except Exception as exc:
         Console().print(f"[bold red]Erro fatal:[/bold red] {exc}")
         return 1
 
 
 def main() -> None:
-    raise SystemExit(asyncio.run(async_main()))
+    try:
+        raise SystemExit(asyncio.run(async_main()))
+    except KeyboardInterrupt:
+        Console().print("[bold yellow]Encerrado (Ctrl+C).[/bold yellow]")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

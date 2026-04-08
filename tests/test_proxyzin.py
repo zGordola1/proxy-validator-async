@@ -47,20 +47,41 @@ def test_protocol_display_label() -> None:
 
 def test_format_output_line() -> None:
     d = proxyzin.ValidProxyDetail(
-        proxy="37.187.92.9:1029",
-        protocol="socks5",
+        proxy="192.168.0.1:8080",
+        protocol="http",
         origin_ip="1.1.1.1",
         judge_url="http://x",
     )
-    assert proxyzin.format_output_line(d, False) == "37.187.92.9:1029 SOCKS5"
-    d2 = proxyzin.ValidProxyDetail(
-        proxy="37.187.92.9:1029",
-        protocol="socks5",
+    assert proxyzin.format_output_line(d, False) == "192.168.0.1:8080 HTTP"
+    br = proxyzin.ValidProxyDetail(
+        proxy="192.168.0.1:8080",
+        protocol="http",
         origin_ip="1.1.1.1",
+        judge_url="http://x",
+        country_code="BR",
+    )
+    assert proxyzin.format_output_line(br, True) == "192.168.0.1:8080 BR HTTP"
+    us = proxyzin.ValidProxyDetail(
+        proxy="1.2.3.4:80",
+        protocol="https",
+        origin_ip="8.8.8.8",
         judge_url="http://x",
         country_code="US",
     )
-    assert proxyzin.format_output_line(d2, True) == "37.187.92.9:1029 SOCKS5 EUA"
+    assert proxyzin.format_output_line(us, True) == "1.2.3.4:80 US HTTPS"
+    gb = proxyzin.ValidProxyDetail(
+        proxy="10.0.0.1:1080",
+        protocol="socks4",
+        origin_ip="9.9.9.9",
+        judge_url="http://x",
+        country_code="GB",
+    )
+    assert proxyzin.format_output_line(gb, True) == "10.0.0.1:1080 UK SOCKS4"
+
+
+def test_country_code_for_output() -> None:
+    assert proxyzin.country_code_for_output("br") == "BR"
+    assert proxyzin.country_code_for_output("GB") == "UK"
 
 
 def test_validate_geo_requests_per_second_rejects_non_positive() -> None:

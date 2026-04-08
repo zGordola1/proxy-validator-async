@@ -7,7 +7,7 @@ Script Python (**ProxyZin**) para coletar proxies de uma ou mais fontes (texto o
 ## Recursos
 
 - Multi-fonte: `-s` / `--source-url` define **de onde baixar** as listas de proxies (URLs separadas por vírgula; texto ou JSON estilo Geonode); **não** aparece no ficheiro `-o` — o que conta na saída é cada proxy validado e o **protocolo** que funcionou.
-- Saída principal (`-o`): uma linha por proxy válido no formato `host:port PROTOCOLO` (ex.: `37.187.92.9:1029 SOCKS5`); com `-g`, acrescenta país curto (ex.: `EUA` quando o código ISO é `US`).
+- Saída principal (`-o`): `host:port PROTOCOLO` (HTTP, HTTPS, SOCKS4 ou SOCKS5 — o que passou no teste); com `-g`: `host:port ISO PROTOCOLO` (códigos **BR**, **US**, etc.; **GB** do ip-api aparece como **UK**).
 - Persistência opcional em **SQLite** (`--sqlite-db`), alinhada ao CSV detalhado (UPSERT por `proxy`).
 - Validação com juiz configurável (`-j`), rotação/fallback entre juízes e limite de taxa (`-r`).
 - `--try-socks` / `-S`: testa também `socks4` e `socks5` (depende de `aiohttp-socks`).

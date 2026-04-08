@@ -1,8 +1,11 @@
-__pycache__/
-.venv/
-venv/
+.venv
+venv
+.git
+.github
+tests
+__pycache__
+*.pyc
 .env
 proxies_validados.txt
 proxies_validados_detalhado.csv
-*.pyc
 *.db

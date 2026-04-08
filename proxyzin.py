@@ -16,7 +16,8 @@ import aiohttp
 from aiohttp import ClientError, ClientSession, ClientTimeout
 
 try:
-    import aiohttp_socks  # noqa: F401 — suporte a proxy socks4/socks5 no ClientSession
+    # aiohttp usa estes esquemas no URL do proxy quando o pacote esta instalado (nao e import direto no fluxo).
+    import aiohttp_socks  # noqa: F401
 
     SOCKS_AVAILABLE = True
 except ImportError:
@@ -121,8 +122,29 @@ class JudgePicker:
             return current
 
 
+def _split_host_port(candidate: str) -> tuple[str, str] | None:
+    """Parse host and port from host:port or [IPv6]:port."""
+    if candidate.startswith("["):
+        if "]:" not in candidate:
+            return None
+        host_bracket, port = candidate.rsplit("]:", maxsplit=1)
+        host = host_bracket[1:].strip()
+        port = port.strip()
+    else:
+        if ":" not in candidate:
+            return None
+        host, port = candidate.rsplit(":", maxsplit=1)
+        host = host.strip()
+        port = port.strip()
+    if not host or not port.isdigit():
+        return None
+    if not (1 <= int(port) <= 65535):
+        return None
+    return host, port
+
+
 def parse_proxy_lines(raw_text: str) -> list[str]:
-    """Normalize and deduplicate proxy list in host:port format."""
+    """Normalize and deduplicate proxy list in host:port or [IPv6]:port format."""
     unique: set[str] = set()
     proxies: list[str] = []
 
@@ -130,24 +152,21 @@ def parse_proxy_lines(raw_text: str) -> list[str]:
         candidate = line.strip()
         if not candidate:
             continue
-        if ":" not in candidate:
+        split = _split_host_port(candidate)
+        if split is None:
             continue
-        host, port = candidate.rsplit(":", maxsplit=1)
-        host = host.strip()
-        port = port.strip()
-        if not host or not port.isdigit():
-            continue
-        if not (1 <= int(port) <= 65535):
-            continue
+        host, port = split
 
+        is_ipv6 = False
         if host not in ("localhost",):
             try:
-                ipaddress.ip_address(host)
+                parsed_ip = ipaddress.ip_address(host)
+                is_ipv6 = isinstance(parsed_ip, ipaddress.IPv6Address)
             except ValueError:
                 # Keep domain-based proxies as well.
                 pass
 
-        normalized = f"{host}:{port}"
+        normalized = f"[{host}]:{port}" if is_ipv6 else f"{host}:{port}"
         if normalized in unique:
             continue
         unique.add(normalized)
@@ -188,7 +207,15 @@ def _proxies_from_json_body(body: object) -> list[str] | None:
             port = item.get("port")
             if ip is None or port is None:
                 continue
-            rows.append(f"{str(ip).strip()}:{str(port).strip()}")
+            ip_s = str(ip).strip()
+            port_s = str(port).strip()
+            try:
+                if isinstance(ipaddress.ip_address(ip_s), ipaddress.IPv6Address):
+                    rows.append(f"[{ip_s}]:{port_s}")
+                else:
+                    rows.append(f"{ip_s}:{port_s}")
+            except ValueError:
+                rows.append(f"{ip_s}:{port_s}")
 
     if isinstance(body, dict):
         data = body.get("data")
@@ -219,21 +246,25 @@ async def fetch_proxies(session: ClientSession, source_url: str) -> list[str]:
     return parse_proxy_lines(payload)
 
 
-async def fetch_proxies_from_sources(session: ClientSession, source_urls: list[str]) -> list[str]:
-    """Mescla varias URLs sem duplicar (ordem da primeira ocorrencia)."""
+async def fetch_proxies_from_sources(
+    session: ClientSession, source_urls: list[str]
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Mescla varias URLs sem duplicar; devolve tambem falhas por URL (erro resumido)."""
     unique: set[str] = set()
     merged: list[str] = []
+    failures: list[tuple[str, str]] = []
     for url in source_urls:
         try:
             batch = await fetch_proxies(session, url)
-        except Exception:
+        except Exception as exc:
+            failures.append((url, f"{type(exc).__name__}: {exc}"))
             continue
         for proxy in batch:
             if proxy in unique:
                 continue
             unique.add(proxy)
             merged.append(proxy)
-    return merged
+    return merged, failures
 
 
 def load_source_urls_from_files(paths: list[Path]) -> list[str]:
@@ -698,7 +729,11 @@ async def run_validation(
 
     async with ClientSession(timeout=timeout, connector=connector) as session:
         console.print("[bold cyan]ProxyZin:[/bold cyan] Baixando proxies...")
-        proxies = await fetch_proxies_from_sources(session, source_urls)
+        proxies, source_failures = await fetch_proxies_from_sources(session, source_urls)
+        if source_failures:
+            console.print("[bold yellow]Aviso:[/bold yellow] algumas fontes falharam ao baixar:")
+            for failed_url, err in source_failures:
+                console.print(f"  [dim]{failed_url}[/dim] — {err}")
         if not proxies:
             console.print("[bold yellow]Nenhum proxy encontrado na fonte.[/bold yellow]")
             output_file.write_text("", encoding="utf-8")

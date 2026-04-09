@@ -60,7 +60,19 @@ def test_format_output_line() -> None:
         judge_url="http://x",
         country_code="BR",
     )
-    assert proxyzin.format_output_line(br, True) == "192.168.0.1:8080 BR HTTP"
+    assert proxyzin.format_output_line(br, True) == "192.168.0.1:8080 | BR | unknown | HTTP"
+    br_loc = proxyzin.ValidProxyDetail(
+        proxy="192.168.0.1:8080",
+        protocol="http",
+        origin_ip="1.1.1.1",
+        judge_url="http://x",
+        country_code="BR",
+        location="Brazil, Sao Paulo, Campinas",
+    )
+    assert (
+        proxyzin.format_output_line(br_loc, True)
+        == "192.168.0.1:8080 | BR | Brazil, Sao Paulo, Campinas | HTTP"
+    )
     us = proxyzin.ValidProxyDetail(
         proxy="1.2.3.4:80",
         protocol="https",
@@ -68,7 +80,7 @@ def test_format_output_line() -> None:
         judge_url="http://x",
         country_code="US",
     )
-    assert proxyzin.format_output_line(us, True) == "1.2.3.4:80 US HTTPS"
+    assert proxyzin.format_output_line(us, True) == "1.2.3.4:80 | US | unknown | HTTPS"
     gb = proxyzin.ValidProxyDetail(
         proxy="10.0.0.1:1080",
         protocol="socks4",
@@ -76,7 +88,18 @@ def test_format_output_line() -> None:
         judge_url="http://x",
         country_code="GB",
     )
-    assert proxyzin.format_output_line(gb, True) == "10.0.0.1:1080 UK SOCKS4"
+    assert proxyzin.format_output_line(gb, True) == "10.0.0.1:1080 | UK | unknown | SOCKS4"
+    no_cc_but_loc = proxyzin.ValidProxyDetail(
+        proxy="10.0.0.2:1080",
+        protocol="socks5",
+        origin_ip="9.9.9.8",
+        judge_url="http://x",
+        location="Germany, Berlin, Berlin",
+    )
+    assert (
+        proxyzin.format_output_line(no_cc_but_loc, True)
+        == "10.0.0.2:1080 | unknown | Germany, Berlin, Berlin | SOCKS5"
+    )
 
 
 def test_country_code_for_output() -> None:

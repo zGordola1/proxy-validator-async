@@ -7,13 +7,14 @@ Script Python (**ProxyZin**) para coletar proxies de uma ou mais fontes (texto o
 ## Recursos
 
 - Multi-fonte: `-s` / `--source-url` define **de onde baixar** as listas de proxies (URLs separadas por vírgula; texto ou JSON estilo Geonode); **não** aparece no ficheiro `-o` — o que conta na saída é cada proxy validado e o **protocolo** que funcionou.
-- Saída principal (`-o`): `host:port PROTOCOLO` (HTTP, HTTPS, SOCKS4 ou SOCKS5 — o que passou no teste); com `-g`: `host:port ISO PROTOCOLO` (códigos **BR**, **US**, etc.; **GB** do ip-api aparece como **UK**).
+- Saída principal (`-o`): `host:port PROTOCOLO` (HTTP, HTTPS, SOCKS4 ou SOCKS5 — o que passou no teste); com `-g`: `host:port | ISO | país/região/cidade | PROTOCOLO` (texto de localização vem do ip-api; **GB** aparece como **UK** na coluna ISO; se a geo falhar, `unknown` nas colunas ISO e/ou localização).
 - Persistência opcional em **SQLite** (`--sqlite-db`), alinhada ao CSV detalhado (UPSERT por `proxy`).
 - Validação com juiz configurável (`-j`), rotação/fallback entre juízes e limite de taxa (`-r`).
 - `--try-socks` / `-S`: testa também `socks4` e `socks5` (depende de `aiohttp-socks`).
 - Semáforo global de concorrência e diagnóstico com `rich`: **Resumo do Diagnóstico Operacional** e **Protocolos válidos** mostram sempre HTTP/HTTPS/SOCKS4/SOCKS5 (sucessos com rótulo legível, não só `ok_*`).
 - CSV opcional (`-d`) com `protocol`, `origin_ip`, `location`, `country_code`, `judge_url`.
-- Geo opcional (`-g`) via `ip-api` (campo `countryCode` para o sufixo no `-o`).
+- Geo opcional (`-g`) via `ip-api` (preenche ISO e localização legível no `-o`).
+- **Ctrl+C** durante a validação: mensagem «Operação encerrada» e gravação do ficheiro `-o` (e `-d` / SQLite se configurados) com os proxies já validados até ao momento; código de saída 130.
 
 ## Requisitos
 
@@ -74,10 +75,6 @@ python proxyzin.py -w 20 -c 30 -t 8 -o proxies_validados.txt -r 10 -m append
 | `-S` | `--try-socks` |
 | `-q` | `--no-banner` |
 | `-g` | `--enable-geo` |
-| `-P` | `--geo-provider` |
-| `-y` | `--geo-timeout` |
-| `-K` | `--geo-max-concurrent` |
-| | `--geo-requests-per-second` |
 | `-d` | `--detail-output` |
 | | `--sources-file` |
 | | `--sqlite-db` |
@@ -125,14 +122,13 @@ python proxyzin.py -S -w 20 -r 8
 
 ## Geolocalização e CSV
 
-O provedor default **`ip-api`** (gratuito, sem chave) limita o uso a cerca de **45 pedidos por minuto** por endereço IP de origem. O ProxyZin **deduplica** por `origin_ip` (vários proxies com o mesmo IP de saída geram uma só consulta). Mesmo assim, com muitos IPs únicos, convém:
-
-- baixar a concorrência: `-K 1` ou `-K 2`;
-- e/ou limitar a taxa global de geo: `--geo-requests-per-second 0.75` (≈45/min).
+Com **`-g` / `--enable-geo`** basta: o script usa o **`ip-api`** (gratuito, sem chave), **deduplica** por `origin_ip` e aplica por defeito **~45 pedidos/minuto** ao provedor (equivalente a `--geo-requests-per-second 0.75`), para encaixar no limite típico do plano gratuito.
 
 ```bash
-python proxyzin.py -g -d proxies_validados_detalhado.csv -y 3 -K 4 --geo-requests-per-second 0.75
+python proxyzin.py -g -o proxies_validados.txt -d proxies_validados_detalhado.csv
 ```
+
+**Opções avançadas** (continuam aceites em scripts e CI, mas estão omitidas do `python proxyzin.py --help` para não poluir a lista): `--geo-provider` (`-P`, só `ip-api` por agora), `--geo-timeout` (`-y`, default 3 s), `--geo-max-concurrent` (`-K`, default 10), `--geo-requests-per-second` (sobrepõe o limite default; usa um valor alto só se tiveres quota maior).
 
 Se a API responder mal ou bloquear, as localizações aparecem como `unknown` no CSV/SQLite (o proxy continua válido).
 
@@ -169,9 +165,9 @@ O repositório inclui [`.github/workflows/ci.yml`](.github/workflows/ci.yml): em
 3. **Juiz (`-j`)** — O default (`httpbin.org/ip`) pode sofrer **rate limit** ou indisponibilidade. Podes passar **vários** endpoints separados por vírgula; o baseline e os testes fazem rotação/fallback. O juiz tem de devolver **JSON com campo `origin`** no mesmo estilo do httpbin; APIs só com `ip` (ex. ipify) **não** são compatíveis sem alterar o código.
 4. **SOCKS** — Ver secção SOCKS acima: dependência `aiohttp-socks` e import no arranque.
 
-5. **Saída ordenada** — As entradas válidas são ordenadas por `proxy` antes de gravar `-o`, CSV e SQLite. O ficheiro `-o` é escrito **no fim** da corrida (com protocolo e, se `-g`, país curto), para incluir geo sem reescrever linhas a meio.
+5. **Saída ordenada** — As entradas válidas são ordenadas por `proxy` antes de gravar `-o`, CSV e SQLite. O ficheiro `-o` é escrito **no fim** da corrida (com protocolo e, se `-g`, ISO + localização), para incluir geo sem reescrever linhas a meio.
 
-6. **Geo** — IPs de saída repetidos partilham uma única consulta ao provedor (menos chamadas HTTP). O **ip-api** gratuito tem teto ~**45 req/min**; usa `-K` baixo e opcionalmente `--geo-requests-per-second` (ex. `0.75`) para evitar bloqueios temporários e respostas `unknown`.
+6. **Geo** — IPs de saída repetidos partilham uma única consulta ao provedor. Com `-g`, a taxa ao **ip-api** fica limitada por defeito a ~**45 req/min**; só precisas de afinar `-K` / `--geo-requests-per-second` em cenários raros (ver secção Geolocalização).
 
 7. **`-m` append/final** — Mantido por compatibilidade; em ambos os casos o `-o` é preenchido ao **terminar** (formato enriquecido com protocolo e opcionalmente país).
 

@@ -52,6 +52,9 @@ REASON_PROTOCOL_LABELS: Final[dict[str, str]] = {
 ISO_COUNTRY_OVERRIDES: Final[dict[str, str]] = {"GB": "UK"}
 WRITE_MODES: Final[set[str]] = {"append", "final"}
 GEO_PROVIDERS: Final[set[str]] = {"ip-api"}
+# Com -g, se nao passar --geo-requests-per-second, aplica-se este limite (ip-api gratuito ~45/min).
+GEO_DEFAULT_REQUESTS_PER_SECOND: Final[float] = 0.75
+_OUTPUT_LOCATION_MAX_LEN: Final[int] = 200
 
 PROXYZIN_BANNER = r"""
 __________                             __________.__
@@ -108,15 +111,38 @@ def reason_display_label(reason: str) -> str:
     return reason
 
 
-def format_output_line(detail: ValidProxyDetail, enable_geo: bool) -> str:
-    """Linha para -o: host:port PROTOCOLO ou com -g: host:port ISO PROTOCOLO."""
+def _sanitize_location_line(text: str, max_len: int = _OUTPUT_LOCATION_MAX_LEN) -> str:
+    """Uma linha segura para -o: sem quebras, espacos colapsados, truncada."""
+    line = " ".join(text.split())
+    if len(line) > max_len:
+        line = line[: max_len - 1] + "…"
+    return line
+
+
+def protocol_line_label(detail: ValidProxyDetail) -> str:
+    """Rotulo do protocolo para ficheiro; nunca vazio."""
     label = protocol_display_label(detail.protocol)
+    if label.strip():
+        return label
+    p = detail.protocol.strip()
+    return p.upper() if p else "UNKNOWN"
+
+
+def format_output_line(detail: ValidProxyDetail, enable_geo: bool) -> str:
+    """Linha para -o: host:port PROTOCOLO; com -g: host:port | ISO | localizacao | PROTOCOLO."""
+    label = protocol_line_label(detail)
     if not enable_geo:
         return f"{detail.proxy} {label}"
-    cc = detail.country_code.strip()
-    if cc:
-        return f"{detail.proxy} {country_code_for_output(cc)} {label}"
-    return f"{detail.proxy} unknown {label}"
+    cc_raw = detail.country_code.strip()
+    iso = country_code_for_output(cc_raw) if cc_raw else ""
+    if not iso:
+        iso = "unknown"
+    loc_raw = (detail.location or "").strip()
+    if not loc_raw or loc_raw.lower() == "unknown":
+        loc = "unknown"
+    else:
+        loc = _sanitize_location_line(loc_raw)
+    return f"{detail.proxy} | {iso} | {loc} | {label}"
 
 
 class AsyncRateLimiter:
@@ -587,7 +613,7 @@ async def validate_proxy(
 
 
 async def worker(
-    queue: asyncio.Queue[str],
+    queue: asyncio.Queue[str | None],
     session: ClientSession,
     baseline_ips: set[str],
     timeout_seconds: float,
@@ -606,8 +632,11 @@ async def worker(
     schemes: tuple[str, ...],
 ) -> None:
     while True:
-        proxy = await queue.get()
+        item = await queue.get()
         try:
+            if item is None:
+                break
+            proxy = item
             start_judge_index = await judge_picker.next_start_index()
             result, attempts, rate_wait_events, rate_wait_total_ms = await validate_proxy(
                 session=session,
@@ -719,141 +748,17 @@ def upsert_validated_sqlite(db_path: Path, rows: list[ValidProxyDetail]) -> int:
     return len(rows)
 
 
-async def run_validation(
-    workers: int,
-    max_connections: int,
-    timeout_seconds: float,
-    output_file: Path,
-    source_urls: list[str],
-    judge_url: str,
-    requests_per_second: float | None,
-    _write_mode: str,
-    no_banner: bool,
+def _persist_validation_files(
+    console: Console,
+    valid_details: list[ValidProxyDetail],
     enable_geo: bool,
-    geo_provider: str,
-    geo_timeout: float,
-    geo_max_concurrent: int,
-    geo_requests_per_second: float | None,
+    output_file: Path,
     detail_output: Path | None,
-    schemes: tuple[str, ...],
-    sqlite_db: Path | None = None,
+    sqlite_db: Path | None,
 ) -> None:
-    console = Console()
-    if not no_banner:
-        console.print(f"[bold magenta]{PROXYZIN_BANNER}[/bold magenta]")
-        console.print(
-            "[bold]ProxyZin[/bold] — validador assincrono de proxies HTTP, HTTPS e SOCKS (opcional)\n"
-        )
-    timeout = ClientTimeout(total=timeout_seconds)
-    geo_headroom = geo_max_concurrent if enable_geo else 0
-    connector_limit = max(max_connections + geo_headroom + 32, 64)
-    limit_per_host = max(max_connections, 1)
-    connector = aiohttp.TCPConnector(limit=connector_limit, limit_per_host=limit_per_host)
-    semaphore = asyncio.Semaphore(max_connections)
-    rate_limiter = AsyncRateLimiter(requests_per_second) if requests_per_second is not None else None
-    geo_rate_limiter = (
-        AsyncRateLimiter(geo_requests_per_second)
-        if enable_geo and geo_requests_per_second is not None
-        else None
-    )
-
-    judge_urls = [item.strip() for item in judge_url.split(",") if item.strip()]
-    if not judge_urls:
-        raise ValueError("Ao menos um judge-url valido deve ser informado.")
-    judge_picker = JudgePicker(judge_urls=judge_urls)
-    valid_details: list[ValidProxyDetail] = []
-
-    async with ClientSession(timeout=timeout, connector=connector) as session:
-        console.print("[bold cyan]ProxyZin:[/bold cyan] Baixando proxies...")
-        proxies, source_failures = await fetch_proxies_from_sources(session, source_urls)
-        if source_failures:
-            console.print("[bold yellow]Aviso:[/bold yellow] algumas fontes falharam ao baixar:")
-            for failed_url, err in source_failures:
-                console.print(f"  [dim]{failed_url}[/dim] — {err}")
-        if not proxies:
-            console.print("[bold yellow]Nenhum proxy encontrado na fonte.[/bold yellow]")
-            output_file.write_text("", encoding="utf-8")
-            if detail_output is not None:
-                write_valid_details_csv(detail_output, [])
-            return
-
-        console.print(f"[green]Proxies coletados:[/green] {len(proxies)}")
-        console.print("[bold cyan]ProxyZin:[/bold cyan] Descobrindo IP baseline (sem proxy)...")
-        baseline_ips, baseline_judge = await fetch_baseline_ips_with_fallback(
-            session=session,
-            timeout_seconds=timeout_seconds,
-            judge_urls=judge_urls,
-        )
-        console.print(f"[green]Baseline IP(s):[/green] {', '.join(sorted(baseline_ips))} via {baseline_judge}")
-
-        queue: asyncio.Queue[str] = asyncio.Queue()
-        for proxy in proxies:
-            queue.put_nowait(proxy)
-
-        lock = asyncio.Lock()
-        counters = {"checked": 0, "valid": 0, "invalid": 0}
-        reasons_counter: Counter[str] = Counter()
-        scheme_counter: Counter[str] = Counter()
-        judge_counter: Counter[str] = Counter()
-        rate_stats = {"events": 0.0, "wait_ms": 0.0}
-
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=False,
-        )
-
-        with progress:
-            task_id = progress.add_task("[cyan]Testando[/cyan]", total=queue.qsize())
-            worker_tasks = [
-                asyncio.create_task(
-                    worker(
-                        queue=queue,
-                        session=session,
-                        baseline_ips=baseline_ips,
-                        timeout_seconds=timeout_seconds,
-                        semaphore=semaphore,
-                        state_lock=lock,
-                        progress=progress,
-                        task_id=task_id,
-                        counters=counters,
-                        reasons_counter=reasons_counter,
-                        scheme_counter=scheme_counter,
-                        judge_counter=judge_counter,
-                        judge_picker=judge_picker,
-                        rate_stats=rate_stats,
-                        rate_limiter=rate_limiter,
-                        valid_details=valid_details,
-                        schemes=schemes,
-                    )
-                )
-                for _ in range(workers)
-            ]
-
-            try:
-                await queue.join()
-            finally:
-                for task in worker_tasks:
-                    task.cancel()
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
-
-            if enable_geo and valid_details:
-                console.print("[bold cyan]ProxyZin:[/bold cyan] Geolocalizacao dos IPs validos (direto, sem proxy)...")
-                await apply_geo_to_details(
-                    session=session,
-                    details=valid_details,
-                    provider=geo_provider,
-                    timeout_seconds=geo_timeout,
-                    max_concurrent=geo_max_concurrent,
-                    rate_limiter=geo_rate_limiter,
-                )
-
     valid_details.sort(key=lambda d: d.proxy)
     out_lines = [format_output_line(d, enable_geo) for d in valid_details]
+    output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
 
     if detail_output is not None:
@@ -865,6 +770,20 @@ async def run_validation(
             f"[bold cyan]SQLite:[/bold cyan] {sqlite_db.as_posix()} — {n_sql} registro(s) gravados."
         )
 
+
+def _print_full_validation_report(
+    console: Console,
+    valid_details: list[ValidProxyDetail],
+    counters: dict[str, int],
+    reasons_counter: Counter[str],
+    scheme_counter: Counter[str],
+    judge_counter: Counter[str],
+    judge_urls: list[str],
+    rate_stats: dict[str, float],
+    enable_geo: bool,
+    output_file: Path,
+    detail_output: Path | None,
+) -> None:
     persisted_total = len(valid_details)
     detail_msg = f" | Detalhado: {detail_output.as_posix()}" if detail_output is not None else ""
     console.print(
@@ -915,6 +834,7 @@ async def run_validation(
     console.print(scheme_table)
 
     if enable_geo and valid_details:
+
         def _loc_label(d: ValidProxyDetail) -> str:
             if d.country_code.strip():
                 return country_code_for_output(d.country_code)
@@ -958,12 +878,205 @@ async def run_validation(
     )
 
 
+async def run_validation(
+    workers: int,
+    max_connections: int,
+    timeout_seconds: float,
+    output_file: Path,
+    source_urls: list[str],
+    judge_url: str,
+    requests_per_second: float | None,
+    _write_mode: str,
+    no_banner: bool,
+    enable_geo: bool,
+    geo_provider: str,
+    geo_timeout: float,
+    geo_max_concurrent: int,
+    geo_requests_per_second: float | None,
+    detail_output: Path | None,
+    schemes: tuple[str, ...],
+    sqlite_db: Path | None = None,
+) -> bool:
+    """Retorna True se o utilizador interrompeu (Ctrl+C); ficheiros gravados na mesma."""
+    console = Console()
+    if not no_banner:
+        console.print(f"[bold magenta]{PROXYZIN_BANNER}[/bold magenta]")
+        console.print(
+            "[bold]ProxyZin[/bold] — validador assincrono de proxies HTTP, HTTPS e SOCKS (opcional)\n"
+        )
+    timeout = ClientTimeout(total=timeout_seconds)
+    geo_headroom = geo_max_concurrent if enable_geo else 0
+    connector_limit = max(max_connections + geo_headroom + 32, 64)
+    limit_per_host = max(max_connections, 1)
+    connector = aiohttp.TCPConnector(
+        limit=connector_limit,
+        limit_per_host=limit_per_host,
+        enable_cleanup_closed=True,
+    )
+    semaphore = asyncio.Semaphore(max_connections)
+    rate_limiter = AsyncRateLimiter(requests_per_second) if requests_per_second is not None else None
+    geo_rps_effective: float | None = geo_requests_per_second
+    if enable_geo and geo_rps_effective is None:
+        geo_rps_effective = GEO_DEFAULT_REQUESTS_PER_SECOND
+    geo_rate_limiter = AsyncRateLimiter(geo_rps_effective) if enable_geo else None
+
+    judge_urls = [item.strip() for item in judge_url.split(",") if item.strip()]
+    if not judge_urls:
+        raise ValueError("Ao menos um judge-url valido deve ser informado.")
+    judge_picker = JudgePicker(judge_urls=judge_urls)
+    valid_details: list[ValidProxyDetail] = []
+    counters = {"checked": 0, "valid": 0, "invalid": 0}
+    reasons_counter: Counter[str] = Counter()
+    scheme_counter: Counter[str] = Counter()
+    judge_counter: Counter[str] = Counter()
+    rate_stats = {"events": 0.0, "wait_ms": 0.0}
+    interrupted = False
+
+    async with ClientSession(timeout=timeout, connector=connector) as session:
+        try:
+            console.print("[bold cyan]ProxyZin:[/bold cyan] Baixando proxies...")
+            proxies, source_failures = await fetch_proxies_from_sources(session, source_urls)
+            if source_failures:
+                console.print("[bold yellow]Aviso:[/bold yellow] algumas fontes falharam ao baixar:")
+                for failed_url, err in source_failures:
+                    console.print(f"  [dim]{failed_url}[/dim] — {err}")
+            if not proxies:
+                console.print("[bold yellow]Nenhum proxy encontrado na fonte.[/bold yellow]")
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+                output_file.write_text("", encoding="utf-8")
+                if detail_output is not None:
+                    write_valid_details_csv(detail_output, [])
+                return False
+
+            console.print(f"[green]Proxies coletados:[/green] {len(proxies)}")
+            console.print("[bold cyan]ProxyZin:[/bold cyan] Descobrindo IP baseline (sem proxy)...")
+            baseline_ips, baseline_judge = await fetch_baseline_ips_with_fallback(
+                session=session,
+                timeout_seconds=timeout_seconds,
+                judge_urls=judge_urls,
+            )
+            console.print(f"[green]Baseline IP(s):[/green] {', '.join(sorted(baseline_ips))} via {baseline_judge}")
+
+            queue: asyncio.Queue[str | None] = asyncio.Queue()
+            for proxy in proxies:
+                queue.put_nowait(proxy)
+
+            lock = asyncio.Lock()
+
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("{task.completed}/{task.total}"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=False,
+            )
+
+            with progress:
+                task_id = progress.add_task("[cyan]Testando[/cyan]", total=queue.qsize())
+                worker_tasks = [
+                    asyncio.create_task(
+                        worker(
+                            queue=queue,
+                            session=session,
+                            baseline_ips=baseline_ips,
+                            timeout_seconds=timeout_seconds,
+                            semaphore=semaphore,
+                            state_lock=lock,
+                            progress=progress,
+                            task_id=task_id,
+                            counters=counters,
+                            reasons_counter=reasons_counter,
+                            scheme_counter=scheme_counter,
+                            judge_counter=judge_counter,
+                            judge_picker=judge_picker,
+                            rate_stats=rate_stats,
+                            rate_limiter=rate_limiter,
+                            valid_details=valid_details,
+                            schemes=schemes,
+                        )
+                    )
+                    for _ in range(workers)
+                ]
+
+                try:
+                    await queue.join()
+                except KeyboardInterrupt:
+                    interrupted = True
+                finally:
+                    if interrupted:
+                        for wt in worker_tasks:
+                            wt.cancel()
+                        await asyncio.gather(*worker_tasks, return_exceptions=True)
+                    else:
+                        for _ in range(workers):
+                            queue.put_nowait(None)
+                        await asyncio.gather(*worker_tasks)
+
+            if not interrupted and enable_geo and valid_details:
+                try:
+                    console.print(
+                        "[bold cyan]ProxyZin:[/bold cyan] Geolocalizacao dos IPs validos (direto, sem proxy)..."
+                    )
+                    await apply_geo_to_details(
+                        session=session,
+                        details=valid_details,
+                        provider=geo_provider,
+                        timeout_seconds=geo_timeout,
+                        max_concurrent=geo_max_concurrent,
+                        rate_limiter=geo_rate_limiter,
+                    )
+                except KeyboardInterrupt:
+                    interrupted = True
+
+        except KeyboardInterrupt:
+            interrupted = True
+
+    if interrupted:
+        console.print("[bold yellow]Operação encerrada[/bold yellow] (proxies já validados foram gravados).")
+
+    _persist_validation_files(
+        console=console,
+        valid_details=valid_details,
+        enable_geo=enable_geo,
+        output_file=output_file,
+        detail_output=detail_output,
+        sqlite_db=sqlite_db,
+    )
+
+    if interrupted:
+        console.print(
+            f"[bold]Resumo (interrompido):[/bold] Validos gravados={len(valid_details)} | "
+            f"Testados={counters['checked']} Validos={counters['valid']} Invalidos={counters['invalid']}"
+        )
+        await asyncio.sleep(0)
+        return True
+
+    _print_full_validation_report(
+        console=console,
+        valid_details=valid_details,
+        counters=counters,
+        reasons_counter=reasons_counter,
+        scheme_counter=scheme_counter,
+        judge_counter=judge_counter,
+        judge_urls=judge_urls,
+        rate_stats=rate_stats,
+        enable_geo=enable_geo,
+        output_file=output_file,
+        detail_output=detail_output,
+    )
+    await asyncio.sleep(0)
+    return False
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ProxyZin",
         description="ProxyZin — validador assincrono (HTTP/HTTPS/SOCKS), multi-fonte e diagnostico operacional.",
         epilog=(
-            "Exemplo -o: sem -g «192.168.0.1:8080 HTTP»; com -g «192.168.0.1:8080 BR HTTP» (ISO; GB como UK)."
+            "Exemplo -o: sem -g «192.168.0.1:8080 HTTP»; com -g "
+            "«192.168.0.1:8080 | BR | Brazil, SP, City | HTTP» (ISO; GB como UK na coluna ISO)."
         ),
     )
     parser.add_argument(
@@ -994,7 +1107,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=Path("proxies_validados.txt"),
         help=(
             "Ficheiro de saida: uma linha por proxy valido. "
-            "Se «host:port PROTOCOLO» (HTTP/HTTPS/SOCKS4/SOCKS5). Com -g: «host:port ISO PROTOCOLO» (ex.: BR, US; GB como UK)."
+            "Sem -g: «host:port PROTOCOLO». Com -g: «host:port | ISO | pais/regiao/cidade | PROTOCOLO» (GB como UK)."
         ),
     )
     parser.add_argument(
@@ -1054,8 +1167,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--enable-geo",
         action="store_true",
         help=(
-            "Geolocalizacao do IP de saida (direto, sem proxy). "
-            "No -o, cada linha fica «host:port ISO PROTOCOLO» (codigo pais ip-api; GB exibido como UK)."
+            "Geolocaliza o IP de saida (ip-api, sem chave). No -o: "
+            "«host:port | ISO | pais/regiao/cidade | PROTOCOLO». "
+            f"Taxa default ~{int(GEO_DEFAULT_REQUESTS_PER_SECOND * 60)} pedidos/min para respeitar o limite gratuito."
         ),
     )
     parser.add_argument(
@@ -1064,30 +1178,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="ip-api",
         choices=sorted(GEO_PROVIDERS),
-        help="Provedor de geo (default: ip-api).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "-y",
         "--geo-timeout",
         type=float,
         default=3.0,
-        help="Timeout por consulta geo (default: 3).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "-K",
         "--geo-max-concurrent",
         type=int,
         default=10,
-        help="Concorrencia maxima para geo (default: 10).",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--geo-requests-per-second",
         type=float,
         default=None,
-        help=(
-            "Limite opcional de pedidos/s ao provedor de geo (ex.: 0.75 para ~45/min no ip-api gratuito). "
-            "Combina com -K; aplicado apos deduplicar origin_ip."
-        ),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "-d",
@@ -1155,7 +1266,7 @@ async def async_main() -> int:
         schemes = build_proxy_schemes(args.try_socks)
         source_files = args.sources_file if args.sources_file is not None else []
         source_urls = resolve_source_urls(args.source_url, source_files)
-        await run_validation(
+        interrupted = await run_validation(
             workers=args.workers,
             max_connections=args.max_connections,
             timeout_seconds=args.timeout,
@@ -1174,7 +1285,7 @@ async def async_main() -> int:
             schemes=schemes,
             sqlite_db=args.sqlite_db,
         )
-        return 0
+        return 130 if interrupted else 0
     except Exception as exc:
         Console().print(f"[bold red]Erro fatal:[/bold red] {exc}")
         return 1
@@ -1184,7 +1295,7 @@ def main() -> None:
     try:
         raise SystemExit(asyncio.run(async_main()))
     except KeyboardInterrupt:
-        Console().print("[bold yellow]Encerrado (Ctrl+C).[/bold yellow]")
+        Console().print("[bold yellow]Operação encerrada[/bold yellow]")
         raise SystemExit(130)
 
 

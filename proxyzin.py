@@ -5,6 +5,7 @@ import asyncio
 import csv
 import ipaddress
 import json
+import os
 import sqlite3
 from collections import Counter
 from datetime import datetime, timezone
@@ -630,6 +631,7 @@ async def worker(
     rate_limiter: AsyncRateLimiter | None,
     valid_details: list[ValidProxyDetail],
     schemes: tuple[str, ...],
+    write_queue: asyncio.Queue[ValidProxyDetail | None] | None,
 ) -> None:
     while True:
         item = await queue.get()
@@ -663,15 +665,16 @@ async def worker(
                 rate_stats["wait_ms"] += rate_wait_total_ms
                 if result.is_valid:
                     counters["valid"] += 1
-                    valid_details.append(
-                        ValidProxyDetail(
-                            proxy=result.proxy,
-                            protocol=result.protocol,
-                            origin_ip=result.origin_ip,
-                            judge_url=result.judge_url,
-                            location=result.location,
-                        )
+                    vd = ValidProxyDetail(
+                        proxy=result.proxy,
+                        protocol=result.protocol,
+                        origin_ip=result.origin_ip,
+                        judge_url=result.judge_url,
+                        location=result.location,
                     )
+                    valid_details.append(vd)
+                    if write_queue is not None:
+                        write_queue.put_nowait(vd)
                 else:
                     counters["invalid"] += 1
 
@@ -748,6 +751,46 @@ def upsert_validated_sqlite(db_path: Path, rows: list[ValidProxyDetail]) -> int:
     return len(rows)
 
 
+def _append_line_fsync(path: Path, line: str) -> None:
+    """Anexa uma linha ao ficheiro e força escrita em disco (flush + fsync)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _ensure_output_paths(
+    output_file: Path,
+    detail_output: Path | None,
+    sqlite_db: Path | None,
+) -> None:
+    """Cria diretórios e ficheiro -o vazio no início (caminho válido antes da validação)."""
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text("", encoding="utf-8")
+    if detail_output is not None:
+        detail_output.parent.mkdir(parents=True, exist_ok=True)
+    if sqlite_db is not None:
+        sqlite_db.parent.mkdir(parents=True, exist_ok=True)
+
+
+async def output_writer_worker(
+    queue: asyncio.Queue[ValidProxyDetail | None],
+    output_path: Path,
+    enable_geo: bool,
+) -> None:
+    """Consome a fila até receber None; grava cada proxy válido com fsync (sem -g, durante a corrida)."""
+    while True:
+        detail = await queue.get()
+        try:
+            if detail is None:
+                break
+            line = format_output_line(detail, enable_geo) + "\n"
+            await asyncio.to_thread(_append_line_fsync, output_path, line)
+        finally:
+            queue.task_done()
+
+
 def _persist_validation_files(
     console: Console,
     valid_details: list[ValidProxyDetail],
@@ -759,7 +802,11 @@ def _persist_validation_files(
     valid_details.sort(key=lambda d: d.proxy)
     out_lines = [format_output_line(d, enable_geo) for d in valid_details]
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text("\n".join(out_lines) + ("\n" if out_lines else ""), encoding="utf-8")
+    with output_file.open("w", encoding="utf-8") as handle:
+        if out_lines:
+            handle.write("\n".join(out_lines) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
     if detail_output is not None:
         write_valid_details_csv(detail_output, valid_details)
@@ -931,127 +978,168 @@ async def run_validation(
     judge_counter: Counter[str] = Counter()
     rate_stats = {"events": 0.0, "wait_ms": 0.0}
     interrupted = False
+    cancelled = False
+    writer_task: asyncio.Task[None] | None = None
+    write_queue: asyncio.Queue[ValidProxyDetail | None] | None = None
 
-    async with ClientSession(timeout=timeout, connector=connector) as session:
-        try:
-            console.print("[bold cyan]ProxyZin:[/bold cyan] Baixando proxies...")
-            proxies, source_failures = await fetch_proxies_from_sources(session, source_urls)
-            if source_failures:
-                console.print("[bold yellow]Aviso:[/bold yellow] algumas fontes falharam ao baixar:")
-                for failed_url, err in source_failures:
-                    console.print(f"  [dim]{failed_url}[/dim] — {err}")
-            if not proxies:
-                console.print("[bold yellow]Nenhum proxy encontrado na fonte.[/bold yellow]")
-                output_file.parent.mkdir(parents=True, exist_ok=True)
-                output_file.write_text("", encoding="utf-8")
-                if detail_output is not None:
-                    write_valid_details_csv(detail_output, [])
-                return False
+    _ensure_output_paths(output_file, detail_output, sqlite_db)
 
-            console.print(f"[green]Proxies coletados:[/green] {len(proxies)}")
-            console.print("[bold cyan]ProxyZin:[/bold cyan] Descobrindo IP baseline (sem proxy)...")
-            baseline_ips, baseline_judge = await fetch_baseline_ips_with_fallback(
-                session=session,
-                timeout_seconds=timeout_seconds,
-                judge_urls=judge_urls,
-            )
-            console.print(f"[green]Baseline IP(s):[/green] {', '.join(sorted(baseline_ips))} via {baseline_judge}")
-
-            queue: asyncio.Queue[str | None] = asyncio.Queue()
-            for proxy in proxies:
-                queue.put_nowait(proxy)
-
-            lock = asyncio.Lock()
-
-            progress = Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                TextColumn("{task.completed}/{task.total}"),
-                TimeElapsedColumn(),
-                console=console,
-                transient=False,
-            )
-
-            with progress:
-                task_id = progress.add_task("[cyan]Testando[/cyan]", total=queue.qsize())
-                worker_tasks = [
-                    asyncio.create_task(
-                        worker(
-                            queue=queue,
-                            session=session,
-                            baseline_ips=baseline_ips,
-                            timeout_seconds=timeout_seconds,
-                            semaphore=semaphore,
-                            state_lock=lock,
-                            progress=progress,
-                            task_id=task_id,
-                            counters=counters,
-                            reasons_counter=reasons_counter,
-                            scheme_counter=scheme_counter,
-                            judge_counter=judge_counter,
-                            judge_picker=judge_picker,
-                            rate_stats=rate_stats,
-                            rate_limiter=rate_limiter,
-                            valid_details=valid_details,
-                            schemes=schemes,
-                        )
-                    )
-                    for _ in range(workers)
-                ]
-
-                try:
-                    await queue.join()
-                except KeyboardInterrupt:
-                    interrupted = True
-                finally:
-                    if interrupted:
-                        for wt in worker_tasks:
-                            wt.cancel()
-                        await asyncio.gather(*worker_tasks, return_exceptions=True)
-                    else:
-                        for _ in range(workers):
-                            queue.put_nowait(None)
-                        await asyncio.gather(*worker_tasks)
-
-            if not interrupted and enable_geo and valid_details:
-                try:
-                    console.print(
-                        "[bold cyan]ProxyZin:[/bold cyan] Geolocalizacao dos IPs validos (direto, sem proxy)..."
-                    )
-                    await apply_geo_to_details(
+    try:
+        async with ClientSession(timeout=timeout, connector=connector) as session:
+            try:
+                console.print("[bold cyan]ProxyZin:[/bold cyan] Baixando proxies...")
+                proxies, source_failures = await fetch_proxies_from_sources(session, source_urls)
+                if source_failures:
+                    console.print("[bold yellow]Aviso:[/bold yellow] algumas fontes falharam ao baixar:")
+                    for failed_url, err in source_failures:
+                        console.print(f"  [dim]{failed_url}[/dim] — {err}")
+                if not proxies:
+                    console.print("[bold yellow]Nenhum proxy encontrado na fonte.[/bold yellow]")
+                else:
+                    console.print(f"[green]Proxies coletados:[/green] {len(proxies)}")
+                    console.print("[bold cyan]ProxyZin:[/bold cyan] Descobrindo IP baseline (sem proxy)...")
+                    baseline_ips, baseline_judge = await fetch_baseline_ips_with_fallback(
                         session=session,
-                        details=valid_details,
-                        provider=geo_provider,
-                        timeout_seconds=geo_timeout,
-                        max_concurrent=geo_max_concurrent,
-                        rate_limiter=geo_rate_limiter,
+                        timeout_seconds=timeout_seconds,
+                        judge_urls=judge_urls,
                     )
-                except KeyboardInterrupt:
-                    interrupted = True
+                    console.print(f"[green]Baseline IP(s):[/green] {', '.join(sorted(baseline_ips))} via {baseline_judge}")
 
-        except KeyboardInterrupt:
-            interrupted = True
+                    if not enable_geo:
+                        write_queue = asyncio.Queue()
+                        writer_task = asyncio.create_task(
+                            output_writer_worker(write_queue, output_file, False)
+                        )
+
+                    queue: asyncio.Queue[str | None] = asyncio.Queue()
+                    for proxy in proxies:
+                        queue.put_nowait(proxy)
+
+                    lock = asyncio.Lock()
+
+                    progress = Progress(
+                        SpinnerColumn(),
+                        TextColumn("[progress.description]{task.description}"),
+                        BarColumn(),
+                        TextColumn("{task.completed}/{task.total}"),
+                        TimeElapsedColumn(),
+                        console=console,
+                        transient=False,
+                    )
+
+                    with progress:
+                        task_id = progress.add_task("[cyan]Testando[/cyan]", total=queue.qsize())
+                        worker_tasks = [
+                            asyncio.create_task(
+                                worker(
+                                    queue=queue,
+                                    session=session,
+                                    baseline_ips=baseline_ips,
+                                    timeout_seconds=timeout_seconds,
+                                    semaphore=semaphore,
+                                    state_lock=lock,
+                                    progress=progress,
+                                    task_id=task_id,
+                                    counters=counters,
+                                    reasons_counter=reasons_counter,
+                                    scheme_counter=scheme_counter,
+                                    judge_counter=judge_counter,
+                                    judge_picker=judge_picker,
+                                    rate_stats=rate_stats,
+                                    rate_limiter=rate_limiter,
+                                    valid_details=valid_details,
+                                    schemes=schemes,
+                                    write_queue=write_queue,
+                                )
+                            )
+                            for _ in range(workers)
+                        ]
+
+                        try:
+                            await queue.join()
+                        except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                            interrupted = True
+                            if isinstance(exc, asyncio.CancelledError):
+                                cancelled = True
+                        finally:
+                            if interrupted:
+                                for wt in worker_tasks:
+                                    wt.cancel()
+                                await asyncio.gather(*worker_tasks, return_exceptions=True)
+                            else:
+                                for _ in range(workers):
+                                    queue.put_nowait(None)
+                                await asyncio.gather(*worker_tasks)
+
+                        if write_queue is not None and writer_task is not None:
+                            await write_queue.put(None)
+                            try:
+                                await writer_task
+                            finally:
+                                writer_task = None
+                                write_queue = None
+
+                    if not interrupted and enable_geo and valid_details:
+                        try:
+                            console.print(
+                                "[bold cyan]ProxyZin:[/bold cyan] Geolocalizacao dos IPs validos (direto, sem proxy)..."
+                            )
+                            await apply_geo_to_details(
+                                session=session,
+                                details=valid_details,
+                                provider=geo_provider,
+                                timeout_seconds=geo_timeout,
+                                max_concurrent=geo_max_concurrent,
+                                rate_limiter=geo_rate_limiter,
+                            )
+                        except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                            interrupted = True
+                            if isinstance(exc, asyncio.CancelledError):
+                                cancelled = True
+                                raise
+
+            except (KeyboardInterrupt, asyncio.CancelledError) as exc:
+                interrupted = True
+                if isinstance(exc, asyncio.CancelledError):
+                    cancelled = True
+                    raise
+
+    finally:
+        if writer_task is not None and write_queue is not None:
+            try:
+                await write_queue.put(None)
+                await asyncio.wait_for(writer_task, timeout=30.0)
+            except (asyncio.TimeoutError, Exception):
+                writer_task.cancel()
+                await asyncio.gather(writer_task, return_exceptions=True)
+            finally:
+                writer_task = None
+                write_queue = None
+        try:
+            _persist_validation_files(
+                console=console,
+                valid_details=valid_details,
+                enable_geo=enable_geo,
+                output_file=output_file,
+                detail_output=detail_output,
+                sqlite_db=sqlite_db,
+            )
+        except OSError as exc:
+            console.print(f"[bold red]Erro ao gravar saida:[/bold red] {exc}")
 
     if interrupted:
         console.print("[bold yellow]Operação encerrada[/bold yellow] (proxies já validados foram gravados).")
-
-    _persist_validation_files(
-        console=console,
-        valid_details=valid_details,
-        enable_geo=enable_geo,
-        output_file=output_file,
-        detail_output=detail_output,
-        sqlite_db=sqlite_db,
-    )
-
-    if interrupted:
         console.print(
             f"[bold]Resumo (interrompido):[/bold] Validos gravados={len(valid_details)} | "
             f"Testados={counters['checked']} Validos={counters['valid']} Invalidos={counters['invalid']}"
         )
         await asyncio.sleep(0)
+        if cancelled:
+            raise asyncio.CancelledError()
         return True
+
+    if cancelled:
+        raise asyncio.CancelledError()
 
     _print_full_validation_report(
         console=console,
@@ -1286,6 +1374,8 @@ async def async_main() -> int:
             sqlite_db=args.sqlite_db,
         )
         return 130 if interrupted else 0
+    except asyncio.CancelledError:
+        return 130
     except Exception as exc:
         Console().print(f"[bold red]Erro fatal:[/bold red] {exc}")
         return 1
